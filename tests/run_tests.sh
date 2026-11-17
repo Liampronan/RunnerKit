@@ -859,9 +859,10 @@ EOF
   "$INSTALL_SH" --bin-dir "$guarded_bin" >/dev/null 2>&1 || rc=$?
   assert_eq "1" "$rc" "install.sh refuses to overwrite regular file"
 
-  local rel_out
+  local rel_out expected_rel_dir
   rel_out=$(cd "$TEST_ROOT" && "$INSTALL_SH" --bin-dir "./rel-tools")
-  assert_contains "$rel_out" "export PATH=\"${TEST_ROOT}/rel-tools:\$PATH\"" "install.sh prints resolved absolute PATH for relative --bin-dir"
+  expected_rel_dir=$(cd -P "${TEST_ROOT}/rel-tools" && pwd)
+  assert_contains "$rel_out" "export PATH=\"${expected_rel_dir}:\$PATH\"" "install.sh prints resolved absolute PATH for relative --bin-dir"
 
   pass "review-loop edge cases (JSON shadowing, octal/00, glob safety, pause race & bootout failure, retryable resume, stale stderr, install.sh)"
 }
