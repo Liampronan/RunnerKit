@@ -1,0 +1,47 @@
+#!/bin/bash
+# Stub plutil supporting -lint and -extract <key> raw -o - <plist>.
+set -euo pipefail
+
+if [ "${1:-}" = "-lint" ]; then
+  file="${2:-}"
+  [ -f "$file" ] || exit 1
+  grep -q "<plist" "$file" && grep -q "</plist>" "$file"
+  exit 0
+fi
+
+if [ "${1:-}" = "-extract" ]; then
+  key="${2:-}"
+  # Expect: -extract <key> raw -o - <file>
+  file="${6:-}"
+  [ -f "$file" ] || exit 1
+  val=$(awk -v k="$key" '
+    BEGIN { found = 0 }
+    {
+      line = $0
+      pat = "<key>" k "</key>"
+      if (!found && index(line, pat) > 0) {
+        found = 1
+        sub(".*" pat, "", line)
+      }
+      if (found) {
+        if (match(line, /<(string|integer)>[^<]*<\/(string|integer)>/)) {
+          s = substr(line, RSTART, RLENGTH)
+          sub(/^<(string|integer)>/, "", s)
+          sub(/<\/(string|integer)>$/, "", s)
+          gsub(/&apos;/, "\x27", s)
+          gsub(/&quot;/, "\"", s)
+          gsub(/&gt;/, ">", s)
+          gsub(/&lt;/, "<", s)
+          gsub(/&amp;/, "\\&", s)
+          print s
+          exit 0
+        }
+      }
+    }
+    END { if (!found) exit 1 }
+  ' "$file") || exit 1
+  printf '%s\n' "$val"
+  exit 0
+fi
+
+exit 1

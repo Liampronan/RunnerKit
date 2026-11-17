@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+cat <<EOF
+System-wide power settings:
+Currently in use:
+ standby              0
+ autorestart          1
+ disksleep            0
+ sleep                ${STUB_PMSET_SLEEP:-0}
+ displaysleep         10
+EOF

@@ -1,0 +1,2167 @@
+#!/bin/bash
+# runnerkit — keep self-hosted GitHub Actions runners on macOS healthy.
+# Compatible with stock macOS /bin/bash 3.2 and BSD userland.
+
+set -euo pipefail
+
+RUNNERKIT_VERSION="1.0.0"
+RUNNERKIT_SCHEMA=1
+AGENT_LABEL="io.runnerkit.heal"
+DEFAULT_MIN_FREE_GB=20
+DEFAULT_AGENT_INTERVAL_MIN=15
+DEFAULT_LOG_LINES=50
+FLAP_THRESHOLD=3
+
+# Log patterns indicating GitHub has deleted, revoked, or rejected a runner's
+# registration so restarting the service cannot recover it. Verified against
+# actions/runner BrokerMessageListener.cs, MessageListener.cs, and Runner.cs;
+# extend this list as additional server-side rejection messages are observed.
+REJECTED_PATTERNS=(
+  "The runner registration has been deleted from the server"
+  "The runner no longer exists on the server"
+  "Runner OAuth token has been revoked"
+  "TaskAgentNotFoundException"
+  "RunnerNotFoundException"
+  "TaskAgentPoolNotFoundException"
+  "TaskAgentAccessTokenExpiredException"
+  "HostedRunnerDeprovisionedException"
+  "invalid_client"
+  "Please reconfigure the runner"
+  "please re-configure"
+)
+
+# Per-instance parallel arrays (Bash 3.2 has no associative arrays).
+INST_COUNT=0
+INST_NAME=()
+INST_LABEL=()
+INST_PLIST=()
+INST_TARGET=()
+INST_TARGET_SHORT=()
+INST_DIR=()
+INST_STDOUT=()
+INST_STDERR=()
+INST_STATE=()
+INST_PID=()
+INST_LOADED=()
+INST_BUSY=()
+INST_LAST_EXIT=()
+INST_RESTARTS=()
+INST_ACTION=()
+INST_UNHEALTHY_PAUSED=()
+INST_PAUSED_SINCE=()
+INST_PAUSED_EPOCH=()
+INST_PAUSED_REASON=()
+INST_LOG_TAIL=()
+
+# Doctor check parallel arrays.
+CHECK_COUNT=0
+CHECK_ID=()
+CHECK_RESULT=()
+CHECK_VALUE=()
+CHECK_REMEDY=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  runnerkit status [--json] [--summary FILE]
+  runnerkit heal [--dry-run] [--force] [--json] [--summary FILE]
+  runnerkit doctor [--require-runtime ID]... [--min-free-gb N] [--json] [--summary FILE]
+  runnerkit pause NAME [--reason TEXT] [--now] [--json]
+  runnerkit resume NAME [--json]
+  runnerkit logs NAME [--lines N]
+  runnerkit agent (install [--interval MIN] | uninstall | status)
+  runnerkit version
+EOF
+}
+
+die_usage() {
+  printf 'runnerkit: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+die_env() {
+  printf 'runnerkit: %s\n' "$1" >&2
+  exit 3
+}
+
+die_err() {
+  printf 'runnerkit: %s\n' "$1" >&2
+  exit 1
+}
+
+# Verify macOS and stock required tools (exit 3 if missing).
+require_macos_and_tools() {
+  local os_name
+  os_name=$(uname -s 2>/dev/null || printf 'unknown')
+  if [ "$os_name" != "Darwin" ]; then
+    die_env "requires macOS (detected ${os_name})"
+  fi
+
+  local tool
+  for tool in launchctl plutil pgrep df; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      die_env "required tool not found on PATH: ${tool}"
+    fi
+  done
+}
+
+current_uid() {
+  if [ -n "${RUNNERKIT_UID:-}" ]; then
+    printf '%s' "$RUNNERKIT_UID"
+  else
+    id -u
+  fi
+}
+
+current_user() {
+  if [ -n "${USER:-}" ]; then
+    printf '%s' "$USER"
+  else
+    id -un 2>/dev/null || printf 'unknown'
+  fi
+}
+
+current_host() {
+  local h
+  h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')
+  printf '%s' "$h"
+}
+
+now_iso_utc() {
+  if [ -n "${RUNNERKIT_NOW_ISO:-}" ]; then
+    printf '%s' "$RUNNERKIT_NOW_ISO"
+  else
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+  fi
+}
+
+now_epoch_sec() {
+  if [ -n "${RUNNERKIT_NOW_EPOCH:-}" ]; then
+    printf '%s' "$RUNNERKIT_NOW_EPOCH"
+  else
+    date +%s
+  fi
+}
+
+state_dir_path() {
+  printf '%s/Library/Application Support/runnerkit/state' "$HOME"
+}
+
+launch_agents_dir() {
+  printf '%s/Library/LaunchAgents' "$HOME"
+}
+
+agent_plist_path() {
+  printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$AGENT_LABEL"
+}
+
+agent_log_path() {
+  printf '%s/Library/Logs/runnerkit/heal.log' "$HOME"
+}
+
+# Resolve canonical path to this script so `agent install` embeds an absolute path.
+self_script_path() {
+  local src="$0"
+  local dir base
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in
+      /*) ;;
+      *) src="${dir}/${src}" ;;
+    esac
+  done
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  base=$(basename "$src")
+  printf '%s/%s' "$dir" "$base"
+}
+
+# Escape a string for safe inclusion inside JSON double quotes (RFC 8259).
+json_escape() {
+  local s="${1-}"
+  local out=""
+  local bs="\\"
+  local i=0
+  local len=${#s}
+  local ch ord hex
+  while [ "$i" -lt "$len" ]; do
+    ch="${s:$i:1}"
+    case "$ch" in
+      "$bs") out="${out}\\\\" ;;
+      '"')   out="${out}\\\"" ;;
+      $'\n') out="${out}\\n" ;;
+      $'\r') out="${out}\\r" ;;
+      $'\t') out="${out}\\t" ;;
+      $'\b') out="${out}\\b" ;;
+      $'\f') out="${out}\\f" ;;
+      *)
+        ord=32
+        LC_CTYPE=C printf -v ord '%d' "'$ch" 2>/dev/null || ord=32
+        if [ "$ord" -ge 0 ] && [ "$ord" -lt 32 ]; then
+          printf -v hex '\\u%04x' "$ord"
+          out="${out}${hex}"
+        else
+          out="${out}${ch}"
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# Escape XML special characters for plist generation.
+xml_escape() {
+  local s="${1-}"
+  local out=""
+  local i=0
+  local len=${#s}
+  local ch
+  while [ "$i" -lt "$len" ]; do
+    ch="${s:$i:1}"
+    case "$ch" in
+      '&') out="${out}&amp;" ;;
+      '<') out="${out}&lt;" ;;
+      '>') out="${out}&gt;" ;;
+      '"') out="${out}&quot;" ;;
+      "'") out="${out}&apos;" ;;
+      *)   out="${out}${ch}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# Escape pipe and newline characters for Markdown table cells.
+md_escape() {
+  local s="${1-}"
+  s=$(printf '%s' "$s" | tr '\r\n' '  ')
+  local out=""
+  local i=0
+  local len=${#s}
+  local ch
+  while [ "$i" -lt "$len" ]; do
+    ch="${s:$i:1}"
+    case "$ch" in
+      '|') out="${out}\\|" ;;
+      *)   out="${out}${ch}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# Strip leading UTF-8 BOM (0xEF 0xBB 0xBF) if present.
+strip_bom_with_sentinel() {
+  local s="${1-}"
+  local bom
+  bom=$(printf '\357\273\277')
+  s="${s#"$bom"}"
+  printf '%s.' "$s"
+}
+
+# Extract a top-level string property from a small JSON object in pure Bash 3.2.
+# Appends a trailing '.' sentinel so callers preserve trailing newlines with ${raw%.}.
+json_get_string_sentinel() {
+  local json="${1-}"
+  local key="$2"
+  local needle="\"${key}\""
+  local rest="${json#*"$needle"}"
+  if [ "$rest" = "$json" ]; then
+    printf '.'
+    return 0
+  fi
+
+  # Trim leading whitespace before ':'
+  local i=0
+  local len=${#rest}
+  local ch
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    case "$ch" in
+      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$len" ] || [ "${rest:$i:1}" != ":" ]; then
+    printf '.'
+    return 0
+  fi
+  i=$((i + 1))
+
+  # Trim whitespace after ':'
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    case "$ch" in
+      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$len" ] || [ "${rest:$i:1}" != '"' ]; then
+    # null or non-string value
+    printf '.'
+    return 0
+  fi
+  i=$((i + 1))
+
+  local out=""
+  local bs="\\"
+  local esc
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    if [ "$ch" = '"' ]; then
+      printf '%s.' "$out"
+      return 0
+    elif [ "$ch" = "$bs" ]; then
+      i=$((i + 1))
+      if [ "$i" -ge "$len" ]; then
+        break
+      fi
+      esc="${rest:$i:1}"
+      case "$esc" in
+        '"')    out="${out}\"" ;;
+        "$bs")  out="${out}\\" ;;
+        '/')    out="${out}/" ;;
+        'n') out="${out}"$'\n' ;;
+        'r') out="${out}"$'\r' ;;
+        't') out="${out}"$'\t' ;;
+        'b') out="${out}"$'\b' ;;
+        'f') out="${out}"$'\f' ;;
+        *)   out="${out}${esc}" ;;
+      esac
+    else
+      out="${out}${ch}"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s.' "$out"
+}
+
+# Extract a top-level non-negative integer property from a small JSON object.
+json_get_int() {
+  local json="${1-}"
+  local key="$2"
+  local default_val="${3:-0}"
+  local needle="\"${key}\""
+  local rest="${json#*"$needle"}"
+  if [ "$rest" = "$json" ]; then
+    printf '%s' "$default_val"
+    return 0
+  fi
+  local i=0
+  local len=${#rest}
+  local ch
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    case "$ch" in
+      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$len" ] || [ "${rest:$i:1}" != ":" ]; then
+    printf '%s' "$default_val"
+    return 0
+  fi
+  i=$((i + 1))
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    case "$ch" in
+      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  local num=""
+  while [ "$i" -lt "$len" ]; do
+    ch="${rest:$i:1}"
+    case "$ch" in
+      [0-9]) num="${num}${ch}"; i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ -n "$num" ]; then
+    printf '%s' "$((10#$num))"
+  else
+    printf '%s' "$default_val"
+  fi
+}
+
+# Convert YYYY-MM-DDTHH:MM:SSZ to Unix epoch seconds in pure Bash arithmetic.
+iso8601_to_epoch() {
+  local ts="${1-}"
+  case "$ts" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+    *) printf '0'; return 0 ;;
+  esac
+  local Y="${ts:0:4}"
+  local M="${ts:5:2}"
+  local D="${ts:8:2}"
+  local h="${ts:11:2}"
+  local m="${ts:14:2}"
+  local s="${ts:17:2}"
+
+  local y=$((10#$Y))
+  local mo=$((10#$M))
+  local d=$((10#$D))
+  local hh=$((10#$h))
+  local mm=$((10#$m))
+  local ss=$((10#$s))
+
+  if [ "$mo" -le 2 ]; then
+    y=$((y - 1))
+  fi
+  local era
+  if [ "$y" -ge 0 ]; then
+    era=$((y / 400))
+  else
+    era=$(((y - 399) / 400))
+  fi
+  local yoe=$((y - era * 400))
+  local mp
+  if [ "$mo" -gt 2 ]; then
+    mp=$((mo - 3))
+  else
+    mp=$((mo + 9))
+  fi
+  local doy=$(((153 * mp + 2) / 5 + d - 1))
+  local doe=$((yoe * 365 + yoe / 4 - yoe / 100 + doy))
+  local days=$((era * 146097 + doe - 719468))
+  printf '%s' "$((days * 86400 + hh * 3600 + mm * 60 + ss))"
+}
+
+# Human-friendly elapsed duration from seconds.
+format_duration() {
+  local sec="${1:-0}"
+  if [ "$sec" -lt 0 ]; then
+    sec=0
+  fi
+  if [ "$sec" -lt 60 ]; then
+    printf '%ss' "$sec"
+  elif [ "$sec" -lt 3600 ]; then
+    printf '%sm' "$((sec / 60))"
+  elif [ "$sec" -lt 86400 ]; then
+    local h=$((sec / 3600))
+    local m=$(((sec % 3600) / 60))
+    if [ "$m" -gt 0 ]; then
+      printf '%sh %sm' "$h" "$m"
+    else
+      printf '%sh' "$h"
+    fi
+  else
+    local d=$((sec / 86400))
+    local h=$(((sec % 86400) / 3600))
+    if [ "$h" -gt 0 ]; then
+      printf '%sd %sh' "$d" "$h"
+    else
+      printf '%sd' "$d"
+    fi
+  fi
+}
+
+# Redact tokens, bearer credentials, JWTs, and embedded URL passwords from log text.
+mask_secrets() {
+  sed -E \
+    -e 's/(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})/[REDACTED]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/[REDACTED_JWT]/g' \
+    -e 's/([Bb]earer|[Bb]asic)[[:space:]]+[A-Za-z0-9._~+\/=-]{8,}/\1 [REDACTED]/g' \
+    -e 's/(https?:\/\/[^\/@:[:space:]]+:)[^\/@[:space:]]+@/\1[REDACTED]@/g' \
+    -e 's/(--token[[:space:]]+|--pat[[:space:]]+)[^[:space:]"'\'']+/\1[REDACTED]/g' \
+    -e 's/((token|pat|password|secret|authorization)[[:space:]]*[=:][[:space:]]*["'\'']?)[A-Za-z0-9._~+\/=-]{12,}/\1[REDACTED]/gi'
+}
+
+# Extract a string key from an XML or binary plist using stock macOS plutil.
+plist_extract_str() {
+  local plist="$1"
+  local key="$2"
+  plutil -extract "$key" raw -o - "$plist" 2>/dev/null || true
+}
+
+# Return 0 if any descendant of service PID $1 is a Runner.Worker process.
+has_worker_descendant() {
+  local root_pid="$1"
+  if [ -z "$root_pid" ]; then
+    return 1
+  fi
+  local queue=("$root_pid")
+  local idx=0
+  local visited=0
+  local p child children_out
+  while [ "$idx" -lt "${#queue[@]}" ] && [ "$visited" -lt 64 ]; do
+    p="${queue[$idx]}"
+    idx=$((idx + 1))
+    visited=$((visited + 1))
+    if pgrep -f -P "$p" "Runner\.Worker" >/dev/null 2>&1; then
+      return 0
+    fi
+    children_out=$(pgrep -P "$p" 2>/dev/null || true)
+    if [ -n "$children_out" ]; then
+      while IFS= read -r child; do
+        case "$child" in
+          ''|*[!0-9]*) ;;
+          *) queue+=("$child") ;;
+        esac
+      done <<EOF
+$children_out
+EOF
+    fi
+  done
+  return 1
+}
+
+# Query launchd for service status in gui/<uid>/<label>.
+# Sets globals: SVC_LOADED (0/1), SVC_PID ("" or digits), SVC_LAST_EXIT ("" or int).
+SVC_LOADED=0
+SVC_PID=""
+SVC_LAST_EXIT=""
+query_launchd_service() {
+  local uid="$1"
+  local label="$2"
+  SVC_LOADED=0
+  SVC_PID=""
+  SVC_LAST_EXIT=""
+
+  local print_out
+  if print_out=$(launchctl print "gui/${uid}/${label}" 2>/dev/null); then
+    SVC_LOADED=1
+    local pid_line exit_line state_line
+    state_line=$(printf '%s\n' "$print_out" | sed -n -E 's/^[[:space:]]*state = (.*)$/\1/p' | head -n 1)
+    pid_line=$(printf '%s\n' "$print_out" | sed -n -E 's/^[[:space:]]*pid = ([0-9]+).*$/\1/p' | head -n 1)
+    exit_line=$(printf '%s\n' "$print_out" | sed -n -E 's/^[[:space:]]*last exit code = ([-]?[0-9]+).*$/\1/p' | head -n 1)
+    if [ -n "$pid_line" ] && [ "$state_line" != "not running" ]; then
+      SVC_PID="$pid_line"
+    fi
+    if [ -n "$exit_line" ]; then
+      SVC_LAST_EXIT="$exit_line"
+    fi
+    return 0
+  fi
+
+  # Fallback: check `launchctl list` in case print domain syntax is unavailable.
+  local list_out line l_pid l_exit l_label
+  list_out=$(launchctl list 2>/dev/null || true)
+  if [ -n "$list_out" ]; then
+    while IFS=$'\t ' read -r l_pid l_exit l_label; do
+      if [ "$l_label" = "$label" ]; then
+        SVC_LOADED=1
+        if [ "$l_pid" != "-" ] && [ -n "$l_pid" ]; then
+          SVC_PID="$l_pid"
+        fi
+        case "$l_exit" in
+          ''|'-') ;;
+          [-0-9]*) SVC_LAST_EXIT="$l_exit" ;;
+        esac
+        break
+      fi
+    done <<EOF
+$list_out
+EOF
+  fi
+}
+
+# Find the newest _diag/Runner_*.log inside an instance directory (never Worker_*.log).
+newest_runner_diag_log() {
+  local dir="$1"
+  local diag_dir="${dir}/_diag"
+  if [ ! -d "$diag_dir" ]; then
+    return 0
+  fi
+  local newest=""
+  local f
+  for f in "${diag_dir}"/Runner_*.log; do
+    [ -f "$f" ] || continue
+    if [ -z "$newest" ]; then
+      newest="$f"
+    elif [ "$f" -nt "$newest" ]; then
+      newest="$f"
+    elif [ ! "$newest" -nt "$f" ] && [[ "$f" > "$newest" ]]; then
+      newest="$f"
+    fi
+  done
+  if [ -n "$newest" ]; then
+    printf '%s' "$newest"
+  fi
+}
+
+# Recent log slice used for rejected-registration detection.
+# For stdout.log and stderr.log, inspect lines from the most recent listener start onward
+# (bounded to last 80 lines) so stale errors before a re-registration do not linger.
+recent_runner_log_text() {
+  local dir="$1"
+  local stdout_log="$2"
+  local stderr_log="$3"
+
+  if [ -f "$stderr_log" ]; then
+    tail -n 80 "$stderr_log" 2>/dev/null || true
+  fi
+  if [ -f "$stdout_log" ]; then
+    local tail_stdout last_start_line
+    tail_stdout=$(tail -n 120 "$stdout_log" 2>/dev/null || true)
+    last_start_line=$(printf '%s\n' "$tail_stdout" | grep -n "Starting Runner listener" | tail -n 1 | cut -d: -f1 || true)
+    if [ -n "$last_start_line" ]; then
+      printf '%s\n' "$tail_stdout" | tail -n +"$last_start_line"
+    else
+      printf '%s\n' "$tail_stdout" | tail -n 60
+    fi
+  fi
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    local diag_file
+    diag_file=$(newest_runner_diag_log "$dir")
+    if [ -n "$diag_file" ]; then
+      tail -n 120 "$diag_file" 2>/dev/null || true
+    fi
+  fi
+}
+
+matches_rejected_pattern() {
+  local text="${1-}"
+  if [ -z "$text" ]; then
+    return 1
+  fi
+  local pat
+  for pat in "${REJECTED_PATTERNS[@]}"; do
+    if printf '%s\n' "$text" | grep -F -q "$pat" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Collect bounded, secret-masked log excerpt lines for an unhealthy instance.
+collect_unhealthy_log_tail() {
+  local dir="$1"
+  local stdout_log="$2"
+  local stderr_log="$3"
+  local combined=""
+  local line count=0
+
+  if [ -f "$stderr_log" ]; then
+    local err_lines
+    err_lines=$(tail -n 20 "$stderr_log" 2>/dev/null | grep -E '[^[:space:]]' | tail -n 4 | mask_secrets || true)
+    if [ -n "$err_lines" ]; then
+      while IFS= read -r line; do
+        line="stderr: ${line:0:280}"
+        combined="${combined:+${combined}$'\n'}${line}"
+        count=$((count + 1))
+      done <<EOF
+$err_lines
+EOF
+    fi
+  fi
+
+  # RunnerService.js forwards Runner.Listener stderr and exit codes to stdout.log.
+  if [ -f "$stdout_log" ] && [ "$count" -lt 6 ]; then
+    local out_lines
+    out_lines=$(tail -n 40 "$stdout_log" 2>/dev/null | grep -E '(exited with error code|Runner listener exit|Failed to|re-configure|reconfigure|revoked|Stopping the runner|error|Error)' | tail -n 3 | mask_secrets || true)
+    if [ -n "$out_lines" ]; then
+      while IFS= read -r line; do
+        line="stdout: ${line:0:280}"
+        combined="${combined:+${combined}$'\n'}${line}"
+        count=$((count + 1))
+      done <<EOF
+$out_lines
+EOF
+    fi
+  fi
+
+  if [ -n "$dir" ] && [ -d "$dir" ] && [ "$count" -lt 8 ]; then
+    local diag_file
+    diag_file=$(newest_runner_diag_log "$dir")
+    if [ -n "$diag_file" ]; then
+      local diag_lines
+      diag_lines=$(grep -E '(\[ERR |ERROR|Exception|WriteError)' "$diag_file" 2>/dev/null | tail -n 4 | mask_secrets || true)
+      if [ -n "$diag_lines" ]; then
+        while IFS= read -r line; do
+          line="diag: ${line:0:280}"
+          combined="${combined:+${combined}$'\n'}${line}"
+          count=$((count + 1))
+        done <<EOF
+$diag_lines
+EOF
+      fi
+    fi
+  fi
+
+  printf '%s' "$combined"
+}
+
+state_json_file() {
+  local label="$1"
+  printf '%s/%s.json' "$(state_dir_path)" "$label"
+}
+
+paused_state_file() {
+  local label="$1"
+  printf '%s/%s.paused' "$(state_dir_path)" "$label"
+}
+
+read_restart_count() {
+  local label="$1"
+  local f
+  f=$(state_json_file "$label")
+  if [ ! -f "$f" ]; then
+    printf '0'
+    return 0
+  fi
+  local content
+  content=$(cat "$f" 2>/dev/null || true)
+  json_get_int "$content" "restarts" "0"
+}
+
+write_restart_state() {
+  local label="$1"
+  local restarts="$2"
+  local ts="$3"
+  local sdir
+  sdir=$(state_dir_path)
+  mkdir -p "$sdir"
+  local f
+  f=$(state_json_file "$label")
+  cat >"$f" <<EOF
+{
+  "restarts": ${restarts},
+  "last_attempt": "$(json_escape "$ts")"
+}
+EOF
+}
+
+write_pause_record() {
+  local label="$1"
+  local since="$2"
+  local epoch="$3"
+  local reason="${4-}"
+  local sdir
+  sdir=$(state_dir_path)
+  mkdir -p "$sdir"
+  local f
+  f=$(paused_state_file "$label")
+  if [ -n "$reason" ]; then
+    cat >"$f" <<EOF
+{
+  "paused_since": "$(json_escape "$since")",
+  "paused_epoch": ${epoch},
+  "paused_reason": "$(json_escape "$reason")"
+}
+EOF
+  else
+    cat >"$f" <<EOF
+{
+  "paused_since": "$(json_escape "$since")",
+  "paused_epoch": ${epoch},
+  "paused_reason": null
+}
+EOF
+  fi
+}
+
+shorten_target_url() {
+  local url="${1-}"
+  if [ -z "$url" ]; then
+    printf '-'
+    return 0
+  fi
+  local s="${url#https://github.com/}"
+  if [ "$s" != "$url" ]; then
+    s="${s%/}"
+    printf '%s' "$s"
+    return 0
+  fi
+  s="${url#https://}"
+  s="${s#http://}"
+  s="${s%/}"
+  printf '%s' "$s"
+}
+
+# Discover all runner plists and evaluate current state.
+# $1: allow_counter_reset_on_running ("1" for normal status/doctor/heal initial read,
+#     "0" for dry-run or immediate post-heal re-read).
+discover_instances() {
+  local allow_reset="${1:-1}"
+  local preserve_actions="${2:-0}"
+
+  local saved_labels=()
+  local saved_actions=()
+  if [ "$preserve_actions" = "1" ] && [ "$INST_COUNT" -gt 0 ]; then
+    local k=0
+    while [ "$k" -lt "$INST_COUNT" ]; do
+      saved_labels+=("${INST_LABEL[$k]}")
+      saved_actions+=("${INST_ACTION[$k]}")
+      k=$((k + 1))
+    done
+  fi
+
+  INST_COUNT=0
+  INST_NAME=()
+  INST_LABEL=()
+  INST_PLIST=()
+  INST_TARGET=()
+  INST_TARGET_SHORT=()
+  INST_DIR=()
+  INST_STDOUT=()
+  INST_STDERR=()
+  INST_STATE=()
+  INST_PID=()
+  INST_LOADED=()
+  INST_BUSY=()
+  INST_LAST_EXIT=()
+  INST_RESTARTS=()
+  INST_ACTION=()
+  INST_UNHEALTHY_PAUSED=()
+  INST_PAUSED_SINCE=()
+  INST_PAUSED_EPOCH=()
+  INST_PAUSED_REASON=()
+  INST_LOG_TAIL=()
+
+  local agents_dir
+  agents_dir=$(launch_agents_dir)
+  if [ ! -d "$agents_dir" ]; then
+    return 0
+  fi
+
+  local uid
+  uid=$(current_uid)
+
+  local plist
+  for plist in "${agents_dir}"/actions.runner.*.plist; do
+    [ -e "$plist" ] || continue
+
+    local base label dir stdout_log stderr_log
+    base=$(basename "$plist")
+    label=$(plist_extract_str "$plist" "Label")
+    if [ -z "$label" ]; then
+      label="${base%.plist}"
+    fi
+    dir=$(plist_extract_str "$plist" "WorkingDirectory")
+    stdout_log=$(plist_extract_str "$plist" "StandardOutPath")
+    stderr_log=$(plist_extract_str "$plist" "StandardErrorPath")
+    if [ -z "$stdout_log" ]; then
+      stdout_log="${HOME}/Library/Logs/${label}/stdout.log"
+    fi
+    if [ -z "$stderr_log" ]; then
+      stderr_log="${HOME}/Library/Logs/${label}/stderr.log"
+    fi
+
+    local name=""
+    local target=""
+    if [ -n "$dir" ] && [ -f "${dir}/.runner" ]; then
+      local raw_runner stripped_s runner_json raw_name raw_url
+      raw_runner=$(cat "${dir}/.runner" 2>/dev/null || true)
+      stripped_s=$(strip_bom_with_sentinel "$raw_runner")
+      runner_json="${stripped_s%.}"
+      raw_name=$(json_get_string_sentinel "$runner_json" "agentName")
+      name="${raw_name%.}"
+      raw_url=$(json_get_string_sentinel "$runner_json" "gitHubUrl")
+      target="${raw_url%.}"
+    fi
+    if [ -z "$name" ]; then
+      name="${label##*.}"
+    fi
+    local target_short
+    target_short=$(shorten_target_url "$target")
+
+    query_launchd_service "$uid" "$label"
+    local loaded="$SVC_LOADED"
+    local pid="$SVC_PID"
+    local last_exit="$SVC_LAST_EXIT"
+    local is_busy=0
+    if [ -n "$pid" ]; then
+      if has_worker_descendant "$pid"; then
+        is_busy=1
+      fi
+    fi
+
+    local restarts
+    restarts=$(read_restart_count "$label")
+    if [ -n "$pid" ] && [ "$restarts" -gt 0 ] && [ "$allow_reset" = "1" ]; then
+      restarts=0
+      write_restart_state "$label" 0 "$(now_iso_utc)"
+    fi
+
+    local pfile paused_since="" paused_epoch=0 paused_reason="" is_paused=0
+    pfile=$(paused_state_file "$label")
+    if [ -f "$pfile" ]; then
+      is_paused=1
+      local pjson raw_ps raw_pr
+      pjson=$(cat "$pfile" 2>/dev/null || true)
+      raw_ps=$(json_get_string_sentinel "$pjson" "paused_since")
+      paused_since="${raw_ps%.}"
+      paused_epoch=$(json_get_int "$pjson" "paused_epoch" "0")
+      if [ "$paused_epoch" -eq 0 ] && [ -n "$paused_since" ]; then
+        paused_epoch=$(iso8601_to_epoch "$paused_since")
+      fi
+      raw_pr=$(json_get_string_sentinel "$pjson" "paused_reason")
+      paused_reason="${raw_pr%.}"
+    fi
+
+    local state=""
+    local unhealthy_paused=0
+    local log_tail=""
+
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      state="orphaned"
+      log_tail=$(collect_unhealthy_log_tail "" "$stdout_log" "$stderr_log")
+    elif [ "$is_paused" -eq 1 ]; then
+      state="paused"
+      if [ -n "$pid" ] && [ "$is_busy" -eq 1 ]; then
+        unhealthy_paused=1
+      fi
+    elif [ -n "$pid" ]; then
+      if [ "$is_busy" -eq 1 ]; then
+        state="busy"
+      else
+        state="idle"
+      fi
+    else
+      if [ "$loaded" -eq 1 ]; then
+        local recent_logs
+        recent_logs=$(recent_runner_log_text "$dir" "$stdout_log" "$stderr_log")
+        if matches_rejected_pattern "$recent_logs"; then
+          state="rejected"
+        elif [ "$restarts" -ge "$FLAP_THRESHOLD" ]; then
+          state="flapping"
+        else
+          state="stopped"
+        fi
+      else
+        if [ "$restarts" -ge "$FLAP_THRESHOLD" ]; then
+          state="flapping"
+        else
+          state="unloaded"
+        fi
+      fi
+      log_tail=$(collect_unhealthy_log_tail "$dir" "$stdout_log" "$stderr_log")
+    fi
+
+    local action="none"
+    if [ "$preserve_actions" = "1" ] && [ "${#saved_labels[@]}" -gt 0 ]; then
+      local j=0
+      while [ "$j" -lt "${#saved_labels[@]}" ]; do
+        if [ "${saved_labels[$j]}" = "$label" ]; then
+          action="${saved_actions[$j]}"
+          break
+        fi
+        j=$((j + 1))
+      done
+    fi
+
+    INST_NAME+=("$name")
+    INST_LABEL+=("$label")
+    INST_PLIST+=("$plist")
+    INST_TARGET+=("$target")
+    INST_TARGET_SHORT+=("$target_short")
+    INST_DIR+=("$dir")
+    INST_STDOUT+=("$stdout_log")
+    INST_STDERR+=("$stderr_log")
+    INST_STATE+=("$state")
+    INST_PID+=("$pid")
+    INST_LOADED+=("$loaded")
+    INST_BUSY+=("$is_busy")
+    INST_LAST_EXIT+=("$last_exit")
+    INST_RESTARTS+=("$restarts")
+    INST_ACTION+=("$action")
+    INST_UNHEALTHY_PAUSED+=("$unhealthy_paused")
+    INST_PAUSED_SINCE+=("$paused_since")
+    INST_PAUSED_EPOCH+=("$paused_epoch")
+    INST_PAUSED_REASON+=("$paused_reason")
+    INST_LOG_TAIL+=("$log_tail")
+    INST_COUNT=$((INST_COUNT + 1))
+  done
+}
+
+# Return 0 if overall instances + checks are healthy, 1 otherwise.
+compute_overall_healthy() {
+  local i=0
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    case "${INST_STATE[$i]}" in
+      idle|busy) ;;
+      paused)
+        if [ "${INST_UNHEALTHY_PAUSED[$i]}" -eq 1 ]; then
+          return 1
+        fi
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  i=0
+  while [ "$i" -lt "$CHECK_COUNT" ]; do
+    if [ "${CHECK_RESULT[$i]}" = "fail" ]; then
+      return 1
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# Build human-readable DETAIL string for instance index $1.
+instance_detail_text() {
+  local idx="$1"
+  local st="${INST_STATE[$idx]}"
+  local pid="${INST_PID[$idx]}"
+  local lexit="${INST_LAST_EXIT[$idx]}"
+  local restarts="${INST_RESTARTS[$idx]}"
+  local action="${INST_ACTION[$idx]}"
+  local detail=""
+
+  case "$st" in
+    idle|busy)
+      detail="pid ${pid}"
+      ;;
+    paused)
+      local dur_str=""
+      local now_ep
+      now_ep=$(now_epoch_sec)
+      if [ "${INST_PAUSED_EPOCH[$idx]}" -gt 0 ]; then
+        dur_str=" ($(format_duration "$((now_ep - INST_PAUSED_EPOCH[idx]))") ago)"
+      fi
+      detail="since ${INST_PAUSED_SINCE[$idx]}${dur_str}"
+      if [ -n "${INST_PAUSED_REASON[$idx]}" ]; then
+        local clean_reason
+        clean_reason=$(printf '%s' "${INST_PAUSED_REASON[$idx]}" | tr '\r\n' '  ')
+        detail="${detail} — ${clean_reason}"
+      fi
+      if [ -n "$pid" ]; then
+        if [ "${INST_BUSY[$idx]}" -eq 1 ]; then
+          detail="${detail} [still busy, pid ${pid}]"
+        else
+          detail="${detail} [still running, pid ${pid}]"
+        fi
+      fi
+      ;;
+    stopped)
+      if [ -n "$lexit" ]; then
+        detail="last exit ${lexit}"
+      else
+        detail="no pid"
+      fi
+      if [ "$restarts" -gt 0 ]; then
+        detail="${detail} (restarts: ${restarts})"
+      fi
+      ;;
+    unloaded)
+      detail="not loaded in gui/$(current_uid)"
+      ;;
+    rejected)
+      if [ -n "$lexit" ]; then
+        detail="registration rejected (last exit ${lexit})"
+      else
+        detail="registration rejected"
+      fi
+      ;;
+    flapping)
+      detail="failed ${restarts} consecutive restarts"
+      if [ -n "$lexit" ]; then
+        detail="${detail} (last exit ${lexit})"
+      fi
+      ;;
+    orphaned)
+      detail="missing directory: ${INST_DIR[$idx]}"
+      ;;
+  esac
+
+  if [ -n "$action" ] && [ "$action" != "none" ]; then
+    detail="${detail:+${detail}; }action: ${action}"
+  fi
+  printf '%s' "$detail"
+}
+
+print_human_report() {
+  local include_checks="${1:-0}"
+  printf 'host: %s   kit: %s\n' "$(current_host)" "$RUNNERKIT_VERSION"
+
+  if [ "$INST_COUNT" -eq 0 ]; then
+    printf 'no runner instances found in %s\n' "$(launch_agents_dir)"
+  else
+    printf '%-18s %-22s %-10s %s\n' "NAME" "TARGET" "STATE" "DETAIL"
+    local i=0
+    local line
+    while [ "$i" -lt "$INST_COUNT" ]; do
+      printf '%-18s %-22s %-10s %s\n' \
+        "${INST_NAME[$i]}" \
+        "${INST_TARGET_SHORT[$i]}" \
+        "${INST_STATE[$i]}" \
+        "$(instance_detail_text "$i")"
+      if [ -n "${INST_LOG_TAIL[$i]}" ]; then
+        while IFS= read -r line; do
+          [ -n "$line" ] && printf '    %s\n' "$line"
+        done <<EOF
+${INST_LOG_TAIL[$i]}
+EOF
+      fi
+      i=$((i + 1))
+    done
+  fi
+
+  if [ "$include_checks" = "1" ] && [ "$CHECK_COUNT" -gt 0 ]; then
+    printf 'CHECKS\n'
+    local c=0
+    while [ "$c" -lt "$CHECK_COUNT" ]; do
+      printf '%-5s %-9s %s\n' "${CHECK_RESULT[$c]}" "${CHECK_ID[$c]}" "${CHECK_VALUE[$c]}"
+      if [ "${CHECK_RESULT[$c]}" != "ok" ] && [ -n "${CHECK_REMEDY[$c]}" ]; then
+        printf '      remedy: %s\n' "${CHECK_REMEDY[$c]}"
+      fi
+      c=$((c + 1))
+    done
+  fi
+}
+
+print_json_report() {
+  local healthy_bool="false"
+  if compute_overall_healthy; then
+    healthy_bool="true"
+  fi
+
+  printf '{\n'
+  printf '  "schema": %s,\n' "$RUNNERKIT_SCHEMA"
+  printf '  "kit_version": "%s",\n' "$(json_escape "$RUNNERKIT_VERSION")"
+  printf '  "host": "%s",\n' "$(json_escape "$(current_host)")"
+  printf '  "healthy": %s,\n' "$healthy_bool"
+
+  if [ "$INST_COUNT" -eq 0 ]; then
+    printf '  "instances": [],\n'
+  else
+    printf '  "instances": [\n'
+    local i=0
+    while [ "$i" -lt "$INST_COUNT" ]; do
+      local pid_json="null"
+      if [ -n "${INST_PID[$i]}" ]; then
+        pid_json="${INST_PID[$i]}"
+      fi
+      local exit_json="null"
+      if [ -n "${INST_LAST_EXIT[$i]}" ]; then
+        exit_json="${INST_LAST_EXIT[$i]}"
+      fi
+      local ps_json="null"
+      if [ -n "${INST_PAUSED_SINCE[$i]}" ]; then
+        ps_json="\"$(json_escape "${INST_PAUSED_SINCE[$i]}")\""
+      fi
+      local pr_json="null"
+      if [ -n "${INST_PAUSED_REASON[$i]}" ]; then
+        pr_json="\"$(json_escape "${INST_PAUSED_REASON[$i]}")\""
+      fi
+
+      printf '    {\n'
+      printf '      "name": "%s",\n' "$(json_escape "${INST_NAME[$i]}")"
+      printf '      "label": "%s",\n' "$(json_escape "${INST_LABEL[$i]}")"
+      printf '      "target": "%s",\n' "$(json_escape "${INST_TARGET[$i]}")"
+      printf '      "dir": "%s",\n' "$(json_escape "${INST_DIR[$i]}")"
+      printf '      "state": "%s",\n' "$(json_escape "${INST_STATE[$i]}")"
+      printf '      "pid": %s,\n' "$pid_json"
+      printf '      "last_exit": %s,\n' "$exit_json"
+      printf '      "restarts": %s,\n' "${INST_RESTARTS[$i]}"
+      printf '      "action": "%s",\n' "$(json_escape "${INST_ACTION[$i]}")"
+      printf '      "paused_since": %s,\n' "$ps_json"
+      printf '      "paused_reason": %s,\n' "$pr_json"
+
+      if [ -z "${INST_LOG_TAIL[$i]}" ]; then
+        printf '      "log_tail": []\n'
+      else
+        printf '      "log_tail": [\n'
+        local lines_arr=()
+        local l
+        while IFS= read -r l; do
+          [ -n "$l" ] && lines_arr+=("$l")
+        done <<EOF
+${INST_LOG_TAIL[$i]}
+EOF
+        local li=0
+        local lcount="${#lines_arr[@]}"
+        while [ "$li" -lt "$lcount" ]; do
+          local comma=","
+          if [ "$((li + 1))" -eq "$lcount" ]; then
+            comma=""
+          fi
+          printf '        "%s"%s\n' "$(json_escape "${lines_arr[$li]}")" "$comma"
+          li=$((li + 1))
+        done
+        printf '      ]\n'
+      fi
+
+      local inst_comma=","
+      if [ "$((i + 1))" -eq "$INST_COUNT" ]; then
+        inst_comma=""
+      fi
+      printf '    }%s\n' "$inst_comma"
+      i=$((i + 1))
+    done
+    printf '  ],\n'
+  fi
+
+  if [ "$CHECK_COUNT" -eq 0 ]; then
+    printf '  "checks": []\n'
+  else
+    printf '  "checks": [\n'
+    local c=0
+    while [ "$c" -lt "$CHECK_COUNT" ]; do
+      local c_comma=","
+      if [ "$((c + 1))" -eq "$CHECK_COUNT" ]; then
+        c_comma=""
+      fi
+      printf '    { "id": "%s", "result": "%s", "value": "%s", "remedy": "%s" }%s\n' \
+        "$(json_escape "${CHECK_ID[$c]}")" \
+        "$(json_escape "${CHECK_RESULT[$c]}")" \
+        "$(json_escape "${CHECK_VALUE[$c]}")" \
+        "$(json_escape "${CHECK_REMEDY[$c]}")" \
+        "$c_comma"
+      c=$((c + 1))
+    done
+    printf '  ]\n'
+  fi
+  printf '}\n'
+}
+
+# shellcheck disable=SC2016
+write_markdown_summary() {
+  local summary_file="$1"
+  local include_checks="${2:-0}"
+  local status_word="Healthy"
+  if ! compute_overall_healthy; then
+    status_word="Needs attention"
+  fi
+
+  {
+    printf '### RunnerKit Report — %s\n\n' "$status_word"
+    printf 'Host: `%s` | RunnerKit: `%s`\n\n' "$(md_escape "$(current_host)")" "$RUNNERKIT_VERSION"
+
+    if [ "$INST_COUNT" -eq 0 ]; then
+      printf '_No runner instances found in `~/Library/LaunchAgents`._\n\n'
+    else
+      printf '| Runner | Target | State | Action | Detail |\n'
+      printf '|---|---|---|---|---|\n'
+      local i=0
+      while [ "$i" -lt "$INST_COUNT" ]; do
+        printf '| `%s` | `%s` | `%s` | `%s` | %s |\n' \
+          "$(md_escape "${INST_NAME[$i]}")" \
+          "$(md_escape "${INST_TARGET_SHORT[$i]}")" \
+          "$(md_escape "${INST_STATE[$i]}")" \
+          "$(md_escape "${INST_ACTION[$i]}")" \
+          "$(md_escape "$(instance_detail_text "$i")")"
+        i=$((i + 1))
+      done
+      printf '\n'
+
+      i=0
+      while [ "$i" -lt "$INST_COUNT" ]; do
+        if [ -n "${INST_LOG_TAIL[$i]}" ]; then
+          printf '<details><summary>Logs: %s (%s)</summary>\n\n```text\n%s\n```\n\n</details>\n\n' \
+            "$(md_escape "${INST_NAME[$i]}")" \
+            "$(md_escape "${INST_STATE[$i]}")" \
+            "${INST_LOG_TAIL[$i]}"
+        fi
+        i=$((i + 1))
+      done
+    fi
+
+    if [ "$include_checks" = "1" ] && [ "$CHECK_COUNT" -gt 0 ]; then
+      printf '#### Machine Checks\n\n'
+      printf '| Result | Check | Value | Remedy |\n'
+      printf '|---|---|---|---|\n'
+      local c=0
+      while [ "$c" -lt "$CHECK_COUNT" ]; do
+        printf '| `%s` | `%s` | %s | %s |\n' \
+          "$(md_escape "${CHECK_RESULT[$c]}")" \
+          "$(md_escape "${CHECK_ID[$c]}")" \
+          "$(md_escape "${CHECK_VALUE[$c]}")" \
+          "$(md_escape "${CHECK_REMEDY[$c]}")"
+        c=$((c + 1))
+      done
+      printf '\n'
+    fi
+  } >>"$summary_file"
+}
+
+# Rotate/truncate ~/Library/Logs/runnerkit/heal.log in-place so launchd's open fd
+# stays valid while disk usage remains bounded.
+rotate_heal_log_if_needed() {
+  local log_file
+  log_file=$(agent_log_path)
+  if [ ! -f "$log_file" ]; then
+    return 0
+  fi
+  local max_bytes="${RUNNERKIT_MAX_LOG_BYTES:-1048576}"
+  local size_bytes
+  size_bytes=$(wc -c <"$log_file" 2>/dev/null | tr -d '[:space:]' || printf '0')
+  case "$size_bytes" in
+    ''|*[!0-9]*) size_bytes=0 ;;
+  esac
+  if [ "$size_bytes" -gt "$max_bytes" ]; then
+    cp "$log_file" "${log_file}.1" 2>/dev/null || true
+    tail -n 200 "${log_file}.1" >"$log_file" 2>/dev/null || : >"$log_file"
+  fi
+}
+
+is_self_runner() {
+  local idx="$1"
+  local self_name="${RUNNER_NAME:-}"
+  if [ -z "$self_name" ]; then
+    return 1
+  fi
+  if [ "${INST_NAME[$idx]}" = "$self_name" ] || [ "${INST_LABEL[$idx]}" = "$self_name" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Resolve NAME (agentName or full launchd label) to index in INST_*.
+# Sets RESOLVED_IDX or exits 1 with valid runner names.
+RESOLVED_IDX=-1
+resolve_instance_or_die() {
+  local query="$1"
+  local matches=()
+  local i=0
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    if [ "${INST_NAME[$i]}" = "$query" ] || [ "${INST_LABEL[$i]}" = "$query" ]; then
+      matches+=("$i")
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "${#matches[@]}" -eq 1 ]; then
+    RESOLVED_IDX="${matches[0]}"
+    return 0
+  fi
+
+  if [ "${#matches[@]}" -gt 1 ]; then
+    local labels_list=""
+    local m
+    for m in "${matches[@]}"; do
+      labels_list="${labels_list:+${labels_list}, }${INST_LABEL[$m]}"
+    done
+    die_err "ambiguous runner name '${query}'; specify full label (${labels_list})"
+  fi
+
+  local valid_names=""
+  i=0
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    valid_names="${valid_names:+${valid_names}, }${INST_NAME[$i]}"
+    i=$((i + 1))
+  done
+  if [ -z "$valid_names" ]; then
+    valid_names="(no runners discovered)"
+  fi
+  die_err "unknown runner '${query}'; valid runners: ${valid_names}"
+}
+
+add_check() {
+  CHECK_ID+=("$1")
+  CHECK_RESULT+=("$2")
+  CHECK_VALUE+=("$3")
+  CHECK_REMEDY+=("$4")
+  CHECK_COUNT=$((CHECK_COUNT + 1))
+}
+
+run_doctor_checks() {
+  local min_free_gb="$1"
+  shift
+  local req_runtimes=()
+  while [ "$#" -gt 0 ]; do
+    [ -n "$1" ] && req_runtimes+=("$1")
+    shift
+  done
+
+  CHECK_COUNT=0
+  CHECK_ID=()
+  CHECK_RESULT=()
+  CHECK_VALUE=()
+  CHECK_REMEDY=()
+
+  # 1. disk check
+  local check_path="$HOME"
+  local i=0
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    if [ -n "${INST_DIR[$i]}" ] && [ -d "${INST_DIR[$i]}" ]; then
+      check_path="${INST_DIR[$i]}"
+      break
+    fi
+    i=$((i + 1))
+  done
+  local avail_kb free_gb
+  avail_kb=$(df -Pk "$check_path" 2>/dev/null | awk 'NR==2 {print $4}' || true)
+  case "$avail_kb" in
+    ''|*[!0-9]*)
+      add_check "disk" "fail" "unable to read free space for ${check_path}" "Verify the volume holding ${check_path} is mounted and accessible."
+      ;;
+    *)
+      free_gb=$((avail_kb / 1048576))
+      if [ "$free_gb" -lt "$min_free_gb" ]; then
+        add_check "disk" "fail" "${free_gb} GB free (minimum ${min_free_gb} GB)" "Free disk space on ${check_path} (e.g. Xcode DerivedData, old simulator runtimes, or runner _work folders)."
+      else
+        add_check "disk" "ok" "${free_gb} GB free" ""
+      fi
+      ;;
+  esac
+
+  # 2. GUI login session check
+  local uid user
+  uid=$(current_uid)
+  user=$(current_user)
+  if launchctl print "gui/${uid}" >/dev/null 2>&1; then
+    add_check "session" "ok" "GUI session for ${user}" ""
+  else
+    add_check "session" "fail" "no GUI session for ${user} (gui/${uid})" "Log in to macOS graphically as ${user} so LaunchAgents in gui/${uid} can run."
+  fi
+
+  # 3. Xcode check
+  local xcode_path=""
+  local selected_xcode_ver="Xcode unknown"
+  if ! command -v xcode-select >/dev/null 2>&1; then
+    add_check "xcode" "fail" "xcode-select not found" "Install Xcode and select it with 'sudo xcode-select -s /Applications/Xcode.app/Contents/Developer'."
+  elif ! xcode_path=$(xcode-select -p 2>/dev/null) || [ -z "$xcode_path" ]; then
+    add_check "xcode" "fail" "no active developer directory" "Install Xcode and run 'sudo xcode-select -s /Applications/Xcode.app/Contents/Developer'."
+  elif ! command -v xcodebuild >/dev/null 2>&1; then
+    add_check "xcode" "fail" "xcodebuild not available (${xcode_path})" "Point xcode-select at full Xcode.app ('sudo xcode-select -s /Applications/Xcode.app/Contents/Developer')."
+  else
+    local xb_out
+    if xb_out=$(xcodebuild -version 2>&1); then
+      selected_xcode_ver=$(printf '%s\n' "$xb_out" | head -n 1 | tr -d '\r')
+      add_check "xcode" "ok" "${selected_xcode_ver} (${xcode_path})" ""
+    else
+      local xb_err
+      xb_err=$(printf '%s\n' "$xb_out" | head -n 1 | tr -d '\r')
+      add_check "xcode" "fail" "${xb_err:-xcodebuild -version failed}" "Run 'sudo xcodebuild -license accept' and 'sudo xcodebuild -runFirstLaunch' on the Mac."
+    fi
+  fi
+
+  # 4. Simulator runtime check (when --require-runtime is supplied)
+  if [ "${#req_runtimes[@]}" -gt 0 ]; then
+    if ! command -v xcrun >/dev/null 2>&1; then
+      add_check "runtime" "fail" "xcrun not available (${selected_xcode_ver} selected)" "Install Xcode and required simulator runtimes."
+    else
+      local sim_out
+      if ! sim_out=$(xcrun simctl list runtimes 2>&1); then
+        add_check "runtime" "fail" "simctl list runtimes failed (${selected_xcode_ver} selected)" "Verify CoreSimulator and run 'sudo xcodebuild -runFirstLaunch'."
+      else
+        local installed_ids=()
+        local line rid
+        while IFS= read -r line; do
+          case "$line" in
+            *"(unavailable"*) continue ;;
+          esac
+          rid=$(printf '%s\n' "$line" | sed -n -E 's/.*com\.apple\.CoreSimulator\.SimRuntime\.([A-Za-z0-9._-]+).*$/\1/p' | head -n 1)
+          if [ -n "$rid" ]; then
+            installed_ids+=("$rid")
+          fi
+        done <<EOF
+$sim_out
+EOF
+
+        local missing_ids=()
+        local req norm_req found inst
+        for req in "${req_runtimes[@]}"; do
+          norm_req="${req#com.apple.CoreSimulator.SimRuntime.}"
+          found=0
+          if [ "${#installed_ids[@]}" -gt 0 ]; then
+            for inst in "${installed_ids[@]}"; do
+              if [ "$inst" = "$norm_req" ]; then
+                found=1
+                break
+              fi
+            done
+          fi
+          if [ "$found" -eq 0 ]; then
+            missing_ids+=("$norm_req")
+          fi
+        done
+
+        local have_str="none"
+        if [ "${#installed_ids[@]}" -gt 0 ]; then
+          have_str=""
+          for inst in "${installed_ids[@]}"; do
+            have_str="${have_str:+${have_str}, }${inst}"
+          done
+        fi
+
+        if [ "${#missing_ids[@]}" -gt 0 ]; then
+          local miss_str=""
+          for req in "${missing_ids[@]}"; do
+            miss_str="${miss_str:+${miss_str}, }${req}"
+          done
+          add_check "runtime" "fail" "${miss_str} not installed (have ${have_str}; ${selected_xcode_ver} selected)" "Install the missing runtime with 'xcodebuild -downloadPlatform <Platform>' (or Xcode > Settings > Components), or update the workflow destination."
+        else
+          local ok_str=""
+          for req in "${req_runtimes[@]}"; do
+            ok_str="${ok_str:+${ok_str}, }${req#com.apple.CoreSimulator.SimRuntime.}"
+          done
+          add_check "runtime" "ok" "installed: ${ok_str}" ""
+        fi
+      fi
+    fi
+  fi
+
+  # 5. Sleep check (warn only)
+  if command -v pmset >/dev/null 2>&1; then
+    local pm_out sleep_val
+    pm_out=$(pmset -g 2>/dev/null || true)
+    sleep_val=$(printf '%s\n' "$pm_out" | sed -n -E 's/^[[:space:]]*sleep[[:space:]]+([0-9]+).*$/\1/p' | head -n 1)
+    if [ -n "$sleep_val" ] && [ "$sleep_val" -gt 0 ]; then
+      add_check "sleep" "warn" "system sleep enabled (${sleep_val} min)" "Disable sleep on the Mac (System Settings > Energy, or 'sudo pmset -a sleep 0 disablesleep 1')."
+    else
+      add_check "sleep" "ok" "system sleep disabled" ""
+    fi
+  else
+    add_check "sleep" "warn" "pmset not available" "Verify macOS power settings keep the runner awake."
+  fi
+
+  # 6. Network reachability check
+  if ! command -v curl >/dev/null 2>&1; then
+    add_check "network" "fail" "curl not found" "Ensure /usr/bin/curl is available and network access is permitted."
+  else
+    local ep failed_ep="" http_code
+    for ep in "https://api.github.com" "https://vstoken.actions.githubusercontent.com/_apis/health"; do
+      http_code=$(curl --silent --location --max-time 5 --output /dev/null --write-out '%{http_code}' "$ep" 2>/dev/null || printf '000')
+      case "$http_code" in
+        [234][0-9][0-9]) ;;
+        *)
+          failed_ep="$ep"
+          break
+          ;;
+      esac
+    done
+    if [ -n "$failed_ep" ]; then
+      add_check "network" "fail" "unreachable: ${failed_ep}" "Check internet, DNS, proxy, or firewall rules from the Mac to github.com and *.actions.githubusercontent.com."
+    else
+      add_check "network" "ok" "github.com and Actions reachable" ""
+    fi
+  fi
+
+  # 7. Paused runners visibility check (Update 1: warn if some paused, fail if every instance is paused)
+  local paused_list=""
+  local paused_count=0
+  local now_ep
+  now_ep=$(now_epoch_sec)
+  i=0
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    if [ "${INST_STATE[$i]}" = "paused" ]; then
+      paused_count=$((paused_count + 1))
+      local pdur="unknown"
+      if [ "${INST_PAUSED_EPOCH[$i]}" -gt 0 ]; then
+        pdur=$(format_duration "$((now_ep - INST_PAUSED_EPOCH[i]))")
+      fi
+      paused_list="${paused_list:+${paused_list}, }${INST_NAME[$i]} (${pdur})"
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "$paused_count" -gt 0 ]; then
+    if [ "$INST_COUNT" -gt 0 ] && [ "$paused_count" -eq "$INST_COUNT" ]; then
+      add_check "paused" "fail" "all ${INST_COUNT} runners paused: ${paused_list}" "Every runner is paused so jobs will queue indefinitely; run 'runnerkit resume <name>'."
+    else
+      add_check "paused" "warn" "${paused_list}" "Run 'runnerkit resume <name>' once the paused runner has been fixed."
+    fi
+  fi
+}
+
+# Future extension point (Section 14): webhook/heartbeat reporting on unfixable issues.
+heal_report_hook() {
+  # Intentionally left as a no-op in v1.
+  :
+}
+
+cmd_status() {
+  local json_mode=0
+  local summary_file=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      --summary)
+        [ "$#" -ge 2 ] || die_usage "--summary requires a file path"
+        summary_file="$2"
+        shift 2
+        ;;
+      *) die_usage "unknown option for status: $1" ;;
+    esac
+  done
+
+  require_macos_and_tools
+  discover_instances 1 0
+
+  if [ -n "$summary_file" ]; then
+    write_markdown_summary "$summary_file" 0
+  fi
+  if [ "$json_mode" -eq 1 ]; then
+    print_json_report
+  else
+    print_human_report 0
+  fi
+
+  if compute_overall_healthy; then
+    exit 0
+  else
+    exit 1
+  fi
+}
+
+cmd_heal() {
+  local dry_run=0
+  local force=0
+  local json_mode=0
+  local summary_file=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --force)   force=1; shift ;;
+      --json)    json_mode=1; shift ;;
+      --summary)
+        [ "$#" -ge 2 ] || die_usage "--summary requires a file path"
+        summary_file="$2"
+        shift 2
+        ;;
+      *) die_usage "unknown option for heal: $1" ;;
+    esac
+  done
+
+  require_macos_and_tools
+  if [ "$dry_run" -eq 0 ]; then
+    rotate_heal_log_if_needed
+  fi
+
+  local allow_reset=1
+  if [ "$dry_run" -eq 1 ]; then
+    allow_reset=0
+  fi
+  discover_instances "$allow_reset" 0
+
+  local uid
+  uid=$(current_uid)
+  local acted=0
+  local i=0
+
+  while [ "$i" -lt "$INST_COUNT" ]; do
+    local st="${INST_STATE[$i]}"
+    local label="${INST_LABEL[$i]}"
+    local plist="${INST_PLIST[$i]}"
+
+    if is_self_runner "$i"; then
+      i=$((i + 1))
+      continue
+    fi
+
+    if [ "$st" = "flapping" ] && [ "$force" -eq 1 ]; then
+      if [ "$dry_run" -eq 0 ]; then
+        INST_RESTARTS[i]=0
+        write_restart_state "$label" 0 "$(now_iso_utc)"
+      fi
+      if [ "${INST_LOADED[$i]}" -eq 1 ]; then
+        st="stopped"
+      else
+        st="unloaded"
+      fi
+    fi
+
+    case "$st" in
+      stopped)
+        if [ "$dry_run" -eq 1 ]; then
+          if [ "$json_mode" -eq 1 ]; then
+            printf 'dry-run: launchctl kickstart -k gui/%s/%s\n' "$uid" "$label" >&2
+          else
+            printf 'dry-run: launchctl kickstart -k gui/%s/%s\n' "$uid" "$label"
+          fi
+          INST_ACTION[i]="would_restart"
+        else
+          local next_r=$((INST_RESTARTS[i] + 1))
+          write_restart_state "$label" "$next_r" "$(now_iso_utc)"
+          launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+          INST_ACTION[i]="restarted"
+          acted=1
+        fi
+        ;;
+      unloaded)
+        if [ "$dry_run" -eq 1 ]; then
+          if [ "$json_mode" -eq 1 ]; then
+            printf 'dry-run: launchctl bootstrap gui/%s %s\n' "$uid" "$plist" >&2
+          else
+            printf 'dry-run: launchctl bootstrap gui/%s %s\n' "$uid" "$plist"
+          fi
+          INST_ACTION[i]="would_load"
+        else
+          local next_u=$((INST_RESTARTS[i] + 1))
+          write_restart_state "$label" "$next_u" "$(now_iso_utc)"
+          launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+          INST_ACTION[i]="loaded"
+          acted=1
+        fi
+        ;;
+      paused)
+        # If a paused runner is found running and idle, stop it again; if running and busy, leave and report.
+        if [ -n "${INST_PID[$i]}" ] && [ "${INST_BUSY[$i]}" -eq 0 ]; then
+          if [ "$dry_run" -eq 1 ]; then
+            if [ "$json_mode" -eq 1 ]; then
+              printf 'dry-run: launchctl disable gui/%s/%s && launchctl bootout gui/%s/%s\n' "$uid" "$label" "$uid" "$label" >&2
+            else
+              printf 'dry-run: launchctl disable gui/%s/%s && launchctl bootout gui/%s/%s\n' "$uid" "$label" "$uid" "$label"
+            fi
+            INST_ACTION[i]="would_stop_paused"
+          else
+            launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+            launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+            INST_ACTION[i]="stopped_paused"
+            acted=1
+          fi
+        fi
+        ;;
+      *)
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [ "$acted" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
+    local wait_s="${RUNNERKIT_HEAL_WAIT:-2}"
+    if [ "$wait_s" != "0" ]; then
+      sleep "$wait_s"
+    fi
+    # Do not reset restart counters during immediate post-action re-read so a
+    # runner that crashes a few seconds later still accumulates flapping count.
+    discover_instances 0 1
+  fi
+
+  if [ -n "$summary_file" ]; then
+    write_markdown_summary "$summary_file" 0
+  fi
+  if [ "$json_mode" -eq 1 ]; then
+    print_json_report
+  else
+    print_human_report 0
+  fi
+
+  if compute_overall_healthy; then
+    exit 0
+  else
+    heal_report_hook
+    exit 1
+  fi
+}
+
+cmd_doctor() {
+  local min_free_gb="$DEFAULT_MIN_FREE_GB"
+  local json_mode=0
+  local summary_file=""
+  local req_runtimes=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json)
+        json_mode=1
+        shift
+        ;;
+      --summary)
+        [ "$#" -ge 2 ] || die_usage "--summary requires a file path"
+        summary_file="$2"
+        shift 2
+        ;;
+      --min-free-gb)
+        [ "$#" -ge 2 ] || die_usage "--min-free-gb requires an integer"
+        case "$2" in
+          ''|*[!0-9]*) die_usage "--min-free-gb must be a non-negative integer: $2" ;;
+        esac
+        min_free_gb="$2"
+        shift 2
+        ;;
+      --require-runtime)
+        [ "$#" -ge 2 ] || die_usage "--require-runtime requires a runtime identifier"
+        # Accept space- or comma-separated tokens in a single argument as well as repeated flags.
+        local tok_list
+        tok_list=$(printf '%s' "$2" | tr ',' ' ')
+        local tok
+        for tok in $tok_list; do
+          [ -n "$tok" ] && req_runtimes+=("$tok")
+        done
+        shift 2
+        ;;
+      *)
+        die_usage "unknown option for doctor: $1"
+        ;;
+    esac
+  done
+
+  require_macos_and_tools
+  discover_instances 1 0
+  run_doctor_checks "$min_free_gb" ${req_runtimes[@]+"${req_runtimes[@]}"}
+
+  if [ -n "$summary_file" ]; then
+    write_markdown_summary "$summary_file" 1
+  fi
+  if [ "$json_mode" -eq 1 ]; then
+    print_json_report
+  else
+    print_human_report 1
+  fi
+
+  if compute_overall_healthy; then
+    exit 0
+  else
+    exit 1
+  fi
+}
+
+cmd_pause() {
+  if [ "$#" -lt 1 ]; then
+    die_usage "pause requires a runner NAME"
+  fi
+  local target_name=""
+  local reason=""
+  local now_flag=0
+  local json_mode=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --reason)
+        [ "$#" -ge 2 ] || die_usage "--reason requires text"
+        reason="$2"
+        shift 2
+        ;;
+      --now)
+        now_flag=1
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die_usage "unknown option for pause: $1"
+        ;;
+      *)
+        if [ -z "$target_name" ]; then
+          target_name="$1"
+          shift
+        else
+          die_usage "unexpected argument for pause: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$target_name" ] || die_usage "pause requires a runner NAME"
+  require_macos_and_tools
+  discover_instances 1 0
+  resolve_instance_or_die "$target_name"
+  local idx="$RESOLVED_IDX"
+
+  if is_self_runner "$idx"; then
+    die_err "cannot pause '${INST_NAME[$idx]}': it is running the current job (RUNNER_NAME=${RUNNER_NAME})"
+  fi
+
+  if [ "${INST_BUSY[$idx]}" -eq 1 ] && [ "$now_flag" -eq 0 ]; then
+    die_err "cannot pause '${INST_NAME[$idx]}': a job is currently running (pass --now to stop it anyway)"
+  fi
+
+  local label="${INST_LABEL[$idx]}"
+  local since="${INST_PAUSED_SINCE[$idx]}"
+  local epoch="${INST_PAUSED_EPOCH[$idx]}"
+  if [ -z "$since" ] || [ "$epoch" -eq 0 ]; then
+    since=$(now_iso_utc)
+    epoch=$(now_epoch_sec)
+  fi
+
+  write_pause_record "$label" "$since" "$epoch" "$reason"
+
+  local uid
+  uid=$(current_uid)
+  launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  if [ "${INST_LOADED[$idx]}" -eq 1 ]; then
+    launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  fi
+
+  INST_ACTION[idx]="paused"
+  discover_instances 0 1
+
+  if [ "$json_mode" -eq 1 ]; then
+    print_json_report
+  else
+    printf 'paused %s (%s)\n' "${INST_NAME[$idx]}" "$label"
+  fi
+  exit 0
+}
+
+cmd_resume() {
+  if [ "$#" -lt 1 ]; then
+    die_usage "resume requires a runner NAME"
+  fi
+  local target_name=""
+  local json_mode=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die_usage "unknown option for resume: $1"
+        ;;
+      *)
+        if [ -z "$target_name" ]; then
+          target_name="$1"
+          shift
+        else
+          die_usage "unexpected argument for resume: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$target_name" ] || die_usage "resume requires a runner NAME"
+  require_macos_and_tools
+  discover_instances 1 0
+  resolve_instance_or_die "$target_name"
+  local idx="$RESOLVED_IDX"
+  local label="${INST_LABEL[$idx]}"
+  local plist="${INST_PLIST[$idx]}"
+  local pfile
+  pfile=$(paused_state_file "$label")
+
+  if [ ! -f "$pfile" ]; then
+    if [ "$json_mode" -eq 1 ]; then
+      print_json_report
+    else
+      printf '%s is not paused\n' "${INST_NAME[$idx]}"
+    fi
+    exit 0
+  fi
+
+  rm -f "$pfile"
+  write_restart_state "$label" 0 "$(now_iso_utc)"
+
+  local uid
+  uid=$(current_uid)
+  launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  query_launchd_service "$uid" "$label"
+  if [ "$SVC_LOADED" -eq 1 ]; then
+    if [ -z "$SVC_PID" ]; then
+      launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+    fi
+  else
+    launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+  fi
+
+  INST_ACTION[idx]="resumed"
+  local wait_s="${RUNNERKIT_HEAL_WAIT:-1}"
+  if [ "$wait_s" != "0" ]; then
+    sleep "$wait_s"
+  fi
+  discover_instances 1 1
+
+  if [ "$json_mode" -eq 1 ]; then
+    print_json_report
+  else
+    printf 'resumed %s (%s)\n' "${INST_NAME[$idx]}" "$label"
+  fi
+  exit 0
+}
+
+cmd_logs() {
+  if [ "$#" -lt 1 ]; then
+    die_usage "logs requires a runner NAME"
+  fi
+  local target_name=""
+  local lines="$DEFAULT_LOG_LINES"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --lines)
+        [ "$#" -ge 2 ] || die_usage "--lines requires a positive integer"
+        case "$2" in
+          ''|*[!0-9]*|0) die_usage "--lines must be a positive integer: $2" ;;
+        esac
+        lines="$2"
+        shift 2
+        ;;
+      -*)
+        die_usage "unknown option for logs: $1"
+        ;;
+      *)
+        if [ -z "$target_name" ]; then
+          target_name="$1"
+          shift
+        else
+          die_usage "unexpected argument for logs: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$target_name" ] || die_usage "logs requires a runner NAME"
+  require_macos_and_tools
+  discover_instances 0 0
+  resolve_instance_or_die "$target_name"
+  local idx="$RESOLVED_IDX"
+
+  local stderr_log="${INST_STDERR[$idx]}"
+  local stdout_log="${INST_STDOUT[$idx]}"
+  local dir="${INST_DIR[$idx]}"
+
+  printf '==> stderr (%s) <==\n' "$stderr_log"
+  if [ -f "$stderr_log" ]; then
+    tail -n "$lines" "$stderr_log" | mask_secrets
+  else
+    printf '(not found)\n'
+  fi
+
+  printf '\n==> stdout (%s) <==\n' "$stdout_log"
+  if [ -f "$stdout_log" ]; then
+    tail -n "$lines" "$stdout_log" | mask_secrets
+  else
+    printf '(not found)\n'
+  fi
+
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    local diag_file
+    diag_file=$(newest_runner_diag_log "$dir")
+    printf '\n==> _diag (%s) <==\n' "${diag_file:-none}"
+    if [ -n "$diag_file" ] && [ -f "$diag_file" ]; then
+      tail -n "$lines" "$diag_file" | mask_secrets
+    else
+      printf '(no Runner_*.log found)\n'
+    fi
+  fi
+}
+
+cmd_agent() {
+  if [ "$#" -lt 1 ]; then
+    die_usage "agent requires a subcommand: install, uninstall, or status"
+  fi
+  local sub="$1"
+  shift
+
+  case "$sub" in
+    install)
+      local interval_min="$DEFAULT_AGENT_INTERVAL_MIN"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --interval)
+            [ "$#" -ge 2 ] || die_usage "--interval requires minutes"
+            case "$2" in
+              ''|*[!0-9]*|0) die_usage "--interval must be a positive integer (minutes): $2" ;;
+            esac
+            interval_min="$2"
+            shift 2
+            ;;
+          *)
+            die_usage "unknown option for agent install: $1"
+            ;;
+        esac
+      done
+      require_macos_and_tools
+
+      local interval_sec=$((interval_min * 60))
+      local plist_file log_file log_dir script_path uid
+      plist_file=$(agent_plist_path)
+      log_file=$(agent_log_path)
+      log_dir=$(dirname "$log_file")
+      script_path=$(self_script_path)
+      uid=$(current_uid)
+
+      mkdir -p "$(launch_agents_dir)" "$log_dir"
+
+      launchctl bootout "gui/${uid}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+
+      cat >"$plist_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "$AGENT_LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$script_path")</string>
+    <string>heal</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${interval_sec}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "$log_file")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$log_file")</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+
+      plutil -lint "$plist_file" >/dev/null
+      launchctl enable "gui/${uid}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/${uid}" "$plist_file"
+      printf 'installed %s (every %s min; log: %s)\n' "$AGENT_LABEL" "$interval_min" "$log_file"
+      ;;
+
+    uninstall)
+      [ "$#" -eq 0 ] || die_usage "agent uninstall takes no options"
+      require_macos_and_tools
+      local plist_file uid
+      plist_file=$(agent_plist_path)
+      uid=$(current_uid)
+      launchctl bootout "gui/${uid}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+      rm -f "$plist_file"
+      printf 'uninstalled %s\n' "$AGENT_LABEL"
+      ;;
+
+    status)
+      [ "$#" -eq 0 ] || die_usage "agent status takes no options"
+      require_macos_and_tools
+      local plist_file log_file uid
+      plist_file=$(agent_plist_path)
+      log_file=$(agent_log_path)
+      uid=$(current_uid)
+
+      if [ ! -f "$plist_file" ]; then
+        printf 'agent: not installed (%s missing)\n' "$plist_file"
+        exit 1
+      fi
+
+      local interval_sec
+      interval_sec=$(plist_extract_str "$plist_file" "StartInterval")
+      query_launchd_service "$uid" "$AGENT_LABEL"
+      if [ "$SVC_LOADED" -eq 1 ]; then
+        printf 'agent: loaded (%s)   interval: %ss   last_exit: %s   log: %s\n' \
+          "$AGENT_LABEL" "${interval_sec:-unknown}" "${SVC_LAST_EXIT:-none}" "$log_file"
+        exit 0
+      else
+        printf 'agent: unloaded (%s)   plist: %s\n' "$AGENT_LABEL" "$plist_file"
+        exit 1
+      fi
+      ;;
+
+    *)
+      die_usage "unknown agent subcommand: $sub"
+      ;;
+  esac
+}
+
+main() {
+  if [ "$#" -lt 1 ]; then
+    usage >&2
+    exit 2
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    status)  cmd_status "$@" ;;
+    heal)    cmd_heal "$@" ;;
+    doctor)  cmd_doctor "$@" ;;
+    pause)   cmd_pause "$@" ;;
+    resume)  cmd_resume "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    agent)   cmd_agent "$@" ;;
+    version|--version|-v)
+      printf 'runnerkit %s\n' "$RUNNERKIT_VERSION"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      die_usage "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
