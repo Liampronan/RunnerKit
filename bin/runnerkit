@@ -264,31 +264,41 @@ strip_bom_with_sentinel() {
 # Extract a top-level string property from a small JSON object in pure Bash 3.2.
 # Appends a trailing '.' sentinel so callers preserve trailing newlines with ${raw%.}.
 json_get_string_sentinel() {
-  local json="${1-}"
+  local search_json="${1-}"
   local key="$2"
   local needle="\"${key}\""
-  local rest="${json#*"$needle"}"
-  if [ "$rest" = "$json" ]; then
-    printf '.'
-    return 0
-  fi
+  local bs="\\"
+  local prefix rest i len ch
 
-  # Trim leading whitespace before ':'
-  local i=0
-  local len=${#rest}
-  local ch
-  while [ "$i" -lt "$len" ]; do
-    ch="${rest:$i:1}"
-    case "$ch" in
-      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
-      *) break ;;
-    esac
+  while :; do
+    rest="${search_json#*"$needle"}"
+    if [ "$rest" = "$search_json" ]; then
+      printf '.'
+      return 0
+    fi
+    prefix="${search_json%%"$needle"*}"
+    search_json="$rest"
+
+    # Skip escaped \"key\" inside a string literal.
+    if [ -n "$prefix" ] && [ "${prefix:$((${#prefix} - 1)):1}" = "$bs" ]; then
+      continue
+    fi
+
+    # Trim leading whitespace before ':'
+    i=0
+    len=${#rest}
+    while [ "$i" -lt "$len" ]; do
+      ch="${rest:$i:1}"
+      case "$ch" in
+        ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+        *) break ;;
+      esac
+    done
+    if [ "$i" -lt "$len" ] && [ "${rest:$i:1}" = ":" ]; then
+      i=$((i + 1))
+      break
+    fi
   done
-  if [ "$i" -ge "$len" ] || [ "${rest:$i:1}" != ":" ]; then
-    printf '.'
-    return 0
-  fi
-  i=$((i + 1))
 
   # Trim whitespace after ':'
   while [ "$i" -lt "$len" ]; do
@@ -306,7 +316,6 @@ json_get_string_sentinel() {
   i=$((i + 1))
 
   local out=""
-  local bs="\\"
   local esc
   while [ "$i" -lt "$len" ]; do
     ch="${rest:$i:1}"
@@ -340,30 +349,41 @@ json_get_string_sentinel() {
 
 # Extract a top-level non-negative integer property from a small JSON object.
 json_get_int() {
-  local json="${1-}"
+  local search_json="${1-}"
   local key="$2"
   local default_val="${3:-0}"
   local needle="\"${key}\""
-  local rest="${json#*"$needle"}"
-  if [ "$rest" = "$json" ]; then
-    printf '%s' "$default_val"
-    return 0
-  fi
-  local i=0
-  local len=${#rest}
-  local ch
-  while [ "$i" -lt "$len" ]; do
-    ch="${rest:$i:1}"
-    case "$ch" in
-      ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
-      *) break ;;
-    esac
+  local bs="\\"
+  local prefix rest i len ch
+
+  while :; do
+    rest="${search_json#*"$needle"}"
+    if [ "$rest" = "$search_json" ]; then
+      printf '%s' "$default_val"
+      return 0
+    fi
+    prefix="${search_json%%"$needle"*}"
+    search_json="$rest"
+
+    if [ -n "$prefix" ] && [ "${prefix:$((${#prefix} - 1)):1}" = "$bs" ]; then
+      continue
+    fi
+
+    i=0
+    len=${#rest}
+    while [ "$i" -lt "$len" ]; do
+      ch="${rest:$i:1}"
+      case "$ch" in
+        ' '|$'\t'|$'\n'|$'\r') i=$((i + 1)) ;;
+        *) break ;;
+      esac
+    done
+    if [ "$i" -lt "$len" ] && [ "${rest:$i:1}" = ":" ]; then
+      i=$((i + 1))
+      break
+    fi
   done
-  if [ "$i" -ge "$len" ] || [ "${rest:$i:1}" != ":" ]; then
-    printf '%s' "$default_val"
-    return 0
-  fi
-  i=$((i + 1))
+
   while [ "$i" -lt "$len" ]; do
     ch="${rest:$i:1}"
     case "$ch" in
@@ -583,30 +603,56 @@ newest_runner_diag_log() {
 }
 
 # Recent log slice used for rejected-registration detection.
-# For stdout.log and stderr.log, inspect lines from the most recent listener start onward
-# (bounded to last 80 lines) so stale errors before a re-registration do not linger.
+# Associate rejection evidence with the current registration (.runner mtime) and
+# most recent listener session so stale entries from earlier registrations do not block heal.
 recent_runner_log_text() {
   local dir="$1"
   local stdout_log="$2"
   local stderr_log="$3"
+  local runner_file=""
+  local diag_file=""
+
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    if [ -f "${dir}/.runner" ]; then
+      runner_file="${dir}/.runner"
+    fi
+    diag_file=$(newest_runner_diag_log "$dir")
+  fi
 
   if [ -f "$stderr_log" ]; then
-    tail -n 80 "$stderr_log" 2>/dev/null || true
-  fi
-  if [ -f "$stdout_log" ]; then
-    local tail_stdout last_start_line
-    tail_stdout=$(tail -n 120 "$stdout_log" 2>/dev/null || true)
-    last_start_line=$(printf '%s\n' "$tail_stdout" | grep -n "Starting Runner listener" | tail -n 1 | cut -d: -f1 || true)
-    if [ -n "$last_start_line" ]; then
-      printf '%s\n' "$tail_stdout" | tail -n +"$last_start_line"
-    else
-      printf '%s\n' "$tail_stdout" | tail -n 60
+    local use_stderr=1
+    if [ -n "$runner_file" ] && [ "$runner_file" -nt "$stderr_log" ]; then
+      use_stderr=0
+    elif [ -n "$diag_file" ] && [ "$diag_file" -nt "$stderr_log" ]; then
+      use_stderr=0
+    fi
+    if [ "$use_stderr" -eq 1 ]; then
+      local tail_stderr last_err_start
+      tail_stderr=$(tail -n 80 "$stderr_log" 2>/dev/null || true)
+      last_err_start=$(printf '%s\n' "$tail_stderr" | grep -n -E "(Starting Runner listener|Connected to GitHub|Runner reconfigured)" | tail -n 1 | cut -d: -f1 || true)
+      if [ -n "$last_err_start" ]; then
+        printf '%s\n' "$tail_stderr" | tail -n +"$last_err_start"
+      else
+        printf '%s\n' "$tail_stderr"
+      fi
     fi
   fi
-  if [ -n "$dir" ] && [ -d "$dir" ]; then
-    local diag_file
-    diag_file=$(newest_runner_diag_log "$dir")
-    if [ -n "$diag_file" ]; then
+
+  if [ -f "$stdout_log" ]; then
+    if [ -z "$runner_file" ] || [ ! "$runner_file" -nt "$stdout_log" ]; then
+      local tail_stdout last_start_line
+      tail_stdout=$(tail -n 120 "$stdout_log" 2>/dev/null || true)
+      last_start_line=$(printf '%s\n' "$tail_stdout" | grep -n -E "(Starting Runner listener|Connected to GitHub|Runner reconfigured)" | tail -n 1 | cut -d: -f1 || true)
+      if [ -n "$last_start_line" ]; then
+        printf '%s\n' "$tail_stdout" | tail -n +"$last_start_line"
+      else
+        printf '%s\n' "$tail_stdout" | tail -n 60
+      fi
+    fi
+  fi
+
+  if [ -n "$diag_file" ]; then
+    if [ -z "$runner_file" ] || [ ! "$runner_file" -nt "$diag_file" ]; then
       tail -n 120 "$diag_file" 2>/dev/null || true
     fi
   fi
@@ -901,8 +947,9 @@ discover_instances() {
       log_tail=$(collect_unhealthy_log_tail "" "$stdout_log" "$stderr_log")
     elif [ "$is_paused" -eq 1 ]; then
       state="paused"
-      if [ -n "$pid" ] && [ "$is_busy" -eq 1 ]; then
+      if [ -n "$pid" ]; then
         unhealthy_paused=1
+        log_tail=$(collect_unhealthy_log_tail "$dir" "$stdout_log" "$stderr_log")
       fi
     elif [ -n "$pid" ]; then
       if [ "$is_busy" -eq 1 ]; then
@@ -1245,7 +1292,7 @@ write_markdown_summary() {
       i=0
       while [ "$i" -lt "$INST_COUNT" ]; do
         if [ -n "${INST_LOG_TAIL[$i]}" ]; then
-          printf '<details><summary>Logs: %s (%s)</summary>\n\n```text\n%s\n```\n\n</details>\n\n' \
+          printf '<details><summary>Logs: %s (%s)</summary>\n\n~~~~text\n%s\n~~~~\n\n</details>\n\n' \
             "$(md_escape "${INST_NAME[$i]}")" \
             "$(md_escape "${INST_STATE[$i]}")" \
             "${INST_LOG_TAIL[$i]}"
@@ -1509,7 +1556,7 @@ EOF
     add_check "network" "fail" "curl not found" "Ensure /usr/bin/curl is available and network access is permitted."
   else
     local ep failed_ep="" http_code
-    for ep in "https://api.github.com" "https://vstoken.actions.githubusercontent.com/_apis/health"; do
+    for ep in "https://github.com" "https://api.github.com" "https://vstoken.actions.githubusercontent.com/_apis/health"; do
       http_code=$(curl --silent --location --max-time 5 --output /dev/null --write-out '%{http_code}' "$ep" 2>/dev/null || printf '000')
       case "$http_code" in
         [234][0-9][0-9]) ;;
@@ -1654,15 +1701,15 @@ cmd_heal() {
       stopped)
         if [ "$dry_run" -eq 1 ]; then
           if [ "$json_mode" -eq 1 ]; then
-            printf 'dry-run: launchctl kickstart -k gui/%s/%s\n' "$uid" "$label" >&2
+            printf 'dry-run: launchctl kickstart gui/%s/%s\n' "$uid" "$label" >&2
           else
-            printf 'dry-run: launchctl kickstart -k gui/%s/%s\n' "$uid" "$label"
+            printf 'dry-run: launchctl kickstart gui/%s/%s\n' "$uid" "$label"
           fi
           INST_ACTION[i]="would_restart"
         else
           local next_r=$((INST_RESTARTS[i] + 1))
           write_restart_state "$label" "$next_r" "$(now_iso_utc)"
-          launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+          launchctl kickstart "gui/${uid}/${label}" >/dev/null 2>&1 || true
           INST_ACTION[i]="restarted"
           acted=1
         fi
@@ -1695,9 +1742,13 @@ cmd_heal() {
             INST_ACTION[i]="would_stop_paused"
           else
             launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
-            launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
-            INST_ACTION[i]="stopped_paused"
-            acted=1
+            query_launchd_service "$uid" "$label"
+            if [ -z "$SVC_PID" ] || ! has_worker_descendant "$SVC_PID"; then
+              if launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1; then
+                INST_ACTION[i]="stopped_paused"
+              fi
+              acted=1
+            fi
           fi
         fi
         ;;
@@ -1756,18 +1807,19 @@ cmd_doctor() {
         case "$2" in
           ''|*[!0-9]*) die_usage "--min-free-gb must be a non-negative integer: $2" ;;
         esac
-        min_free_gb="$2"
+        min_free_gb=$((10#$2))
         shift 2
         ;;
       --require-runtime)
         [ "$#" -ge 2 ] || die_usage "--require-runtime requires a runtime identifier"
-        # Accept space- or comma-separated tokens in a single argument as well as repeated flags.
-        local tok_list
-        tok_list=$(printf '%s' "$2" | tr ',' ' ')
-        local tok
-        for tok in $tok_list; do
+        # Accept space- or comma-separated tokens without pathname globbing.
+        local tok_lines tok
+        tok_lines=$(printf '%s\n' "$2" | tr ', \t' '\n')
+        while IFS= read -r tok; do
           [ -n "$tok" ] && req_runtimes+=("$tok")
-        done
+        done <<EOF
+$tok_lines
+EOF
         shift 2
         ;;
       *)
@@ -1802,6 +1854,7 @@ cmd_pause() {
   fi
   local target_name=""
   local reason=""
+  local reason_given=0
   local now_flag=0
   local json_mode=0
 
@@ -1810,6 +1863,7 @@ cmd_pause() {
       --reason)
         [ "$#" -ge 2 ] || die_usage "--reason requires text"
         reason="$2"
+        reason_given=1
         shift 2
         ;;
       --now)
@@ -1848,21 +1902,62 @@ cmd_pause() {
     die_err "cannot pause '${INST_NAME[$idx]}': a job is currently running (pass --now to stop it anyway)"
   fi
 
+  local runner_name="${INST_NAME[$idx]}"
   local label="${INST_LABEL[$idx]}"
+  local was_paused=0
+  if [ "${INST_STATE[$idx]}" = "paused" ]; then
+    was_paused=1
+  fi
   local since="${INST_PAUSED_SINCE[$idx]}"
   local epoch="${INST_PAUSED_EPOCH[$idx]}"
   if [ -z "$since" ] || [ "$epoch" -eq 0 ]; then
     since=$(now_iso_utc)
     epoch=$(now_epoch_sec)
   fi
-
-  write_pause_record "$label" "$since" "$epoch" "$reason"
+  if [ "$reason_given" -eq 0 ] && [ "$was_paused" -eq 1 ]; then
+    reason="${INST_PAUSED_REASON[$idx]}"
+  fi
 
   local uid
   uid=$(current_uid)
-  launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
-  if [ "${INST_LOADED[$idx]}" -eq 1 ]; then
-    launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  local disable_err="" disable_rc=0
+  disable_err=$(launchctl disable "gui/${uid}/${label}" 2>&1) || disable_rc=$?
+  if [ "$disable_rc" -ne 0 ]; then
+    die_err "failed to disable '${runner_name}' (${label})${disable_err:+: ${disable_err}}"
+  fi
+
+  # Refresh service and busy state immediately before bootout to narrow the race window.
+  query_launchd_service "$uid" "$label"
+  if [ -n "$SVC_PID" ] && [ "$now_flag" -eq 0 ] && has_worker_descendant "$SVC_PID"; then
+    if [ "$was_paused" -eq 0 ]; then
+      launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+    fi
+    die_err "cannot pause '${runner_name}': a job is currently running (pass --now to stop it anyway)"
+  fi
+
+  write_pause_record "$label" "$since" "$epoch" "$reason"
+
+  local bootout_err="" bootout_rc=0
+  if [ "$SVC_LOADED" -eq 1 ]; then
+    bootout_err=$(launchctl bootout "gui/${uid}/${label}" 2>&1) || bootout_rc=$?
+    query_launchd_service "$uid" "$label"
+    local wait_s="${RUNNERKIT_HEAL_WAIT:-1}"
+    if [ "$wait_s" != "0" ]; then
+      local poll=0
+      while [ "$poll" -lt 3 ] && { [ "$SVC_LOADED" -eq 1 ] || [ -n "$SVC_PID" ]; }; do
+        sleep 1
+        query_launchd_service "$uid" "$label"
+        poll=$((poll + 1))
+      done
+    fi
+  fi
+
+  if [ "$bootout_rc" -ne 0 ] || [ "$SVC_LOADED" -eq 1 ] || [ -n "$SVC_PID" ]; then
+    discover_instances 0 0
+    if [ "$json_mode" -eq 1 ]; then
+      print_json_report
+    fi
+    die_err "failed to stop '${runner_name}' (${label})${bootout_err:+: ${bootout_err}}"
   fi
 
   INST_ACTION[idx]="paused"
@@ -1871,7 +1966,7 @@ cmd_pause() {
   if [ "$json_mode" -eq 1 ]; then
     print_json_report
   else
-    printf 'paused %s (%s)\n' "${INST_NAME[$idx]}" "$label"
+    printf 'paused %s (%s)\n' "$runner_name" "$label"
   fi
   exit 0
 }
@@ -1907,6 +2002,7 @@ cmd_resume() {
   discover_instances 1 0
   resolve_instance_or_die "$target_name"
   local idx="$RESOLVED_IDX"
+  local runner_name="${INST_NAME[$idx]}"
   local label="${INST_LABEL[$idx]}"
   local plist="${INST_PLIST[$idx]}"
   local pfile
@@ -1916,37 +2012,64 @@ cmd_resume() {
     if [ "$json_mode" -eq 1 ]; then
       print_json_report
     else
-      printf '%s is not paused\n' "${INST_NAME[$idx]}"
+      printf '%s is not paused\n' "$runner_name"
     fi
     exit 0
   fi
 
-  rm -f "$pfile"
-  write_restart_state "$label" 0 "$(now_iso_utc)"
-
   local uid
   uid=$(current_uid)
-  launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
-  query_launchd_service "$uid" "$label"
-  if [ "$SVC_LOADED" -eq 1 ]; then
-    if [ -z "$SVC_PID" ]; then
-      launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  local enable_err="" enable_rc=0
+  enable_err=$(launchctl enable "gui/${uid}/${label}" 2>&1) || enable_rc=$?
+  if [ "$enable_rc" -ne 0 ]; then
+    if [ "$json_mode" -eq 1 ]; then
+      print_json_report
     fi
-  else
-    launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+    die_err "failed to enable '${runner_name}' (${label})${enable_err:+: ${enable_err}}"
   fi
 
-  INST_ACTION[idx]="resumed"
+  query_launchd_service "$uid" "$label"
+  local start_err="" start_rc=0
+  if [ "$SVC_LOADED" -eq 1 ]; then
+    if [ -z "$SVC_PID" ]; then
+      start_err=$(launchctl kickstart "gui/${uid}/${label}" 2>&1) || start_rc=$?
+    fi
+  else
+    start_err=$(launchctl bootstrap "gui/${uid}" "$plist" 2>&1) || start_rc=$?
+  fi
+  if [ "$start_rc" -ne 0 ]; then
+    launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+    if [ "$json_mode" -eq 1 ]; then
+      print_json_report
+    fi
+    die_err "failed to start '${runner_name}' (${label})${start_err:+: ${start_err}}"
+  fi
+
   local wait_s="${RUNNERKIT_HEAL_WAIT:-1}"
   if [ "$wait_s" != "0" ]; then
     sleep "$wait_s"
   fi
+  query_launchd_service "$uid" "$label"
+  if [ "$SVC_LOADED" -ne 1 ]; then
+    launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+    if [ "$json_mode" -eq 1 ]; then
+      print_json_report
+    fi
+    die_err "failed to restore '${runner_name}' (${label}): service did not stay loaded"
+  fi
+
+  rm -f "$pfile"
+  write_restart_state "$label" 0 "$(now_iso_utc)"
+  INST_ACTION[idx]="resumed"
   discover_instances 1 1
 
   if [ "$json_mode" -eq 1 ]; then
     print_json_report
   else
-    printf 'resumed %s (%s)\n' "${INST_NAME[$idx]}" "$label"
+    printf 'resumed %s (%s)\n' "$runner_name" "$label"
+  fi
+  if [ "${INST_STATE[$idx]}" != "idle" ] && [ "${INST_STATE[$idx]}" != "busy" ]; then
+    die_err "resumed '${runner_name}' (${label}), but service entered state '${INST_STATE[$idx]}'"
   fi
   exit 0
 }
@@ -1963,9 +2086,10 @@ cmd_logs() {
       --lines)
         [ "$#" -ge 2 ] || die_usage "--lines requires a positive integer"
         case "$2" in
-          ''|*[!0-9]*|0) die_usage "--lines must be a positive integer: $2" ;;
+          ''|*[!0-9]*) die_usage "--lines must be a positive integer: $2" ;;
         esac
-        lines="$2"
+        lines=$((10#$2))
+        [ "$lines" -gt 0 ] || die_usage "--lines must be a positive integer: $2"
         shift 2
         ;;
       -*)
@@ -2033,9 +2157,10 @@ cmd_agent() {
           --interval)
             [ "$#" -ge 2 ] || die_usage "--interval requires minutes"
             case "$2" in
-              ''|*[!0-9]*|0) die_usage "--interval must be a positive integer (minutes): $2" ;;
+              ''|*[!0-9]*) die_usage "--interval must be a positive integer (minutes): $2" ;;
             esac
-            interval_min="$2"
+            interval_min=$((10#$2))
+            [ "$interval_min" -gt 0 ] || die_usage "--interval must be a positive integer (minutes): $2"
             shift 2
             ;;
           *)

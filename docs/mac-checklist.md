@@ -11,7 +11,10 @@ cutting a non-prerelease tag (`v1.0.0`) and moving the `v1` tag.
 - Three runner instances configured the standard way (`./config.sh` +
   `./svc.sh install` + `./svc.sh start`) in separate directories.
 - A test or adopting repository with `.github/workflows/runner-doctor.yml` on
-  its default branch calling `Liampronan/RunnerKit/.github/workflows/doctor.yml@v1`.
+  its default branch pinned to the release candidate under test (for example,
+  `uses: Liampronan/RunnerKit/.github/workflows/doctor.yml@v1.0.0-rc.1` with
+  `kit-ref: v1.0.0-rc.1`), so verification exercises the candidate before `v1`
+  is created or moved.
 
 ---
 
@@ -74,18 +77,21 @@ cutting a non-prerelease tag (`v1.0.0`) and moving the `v1` tag.
   - Confirm the job runs on a live sibling, restarts the stopped runner, writes
     the Markdown summary to `$GITHUB_STEP_SUMMARY`, and uploads the
     `runnerkit-doctor` JSON artifact.
-  - Dispatch `Runner doctor` with `pause` set to a sibling runner's name;
-    confirm the sibling is paused with the workflow run URL recorded as the
-    reason.
-  - Dispatch `Runner doctor` with `resume` set to that sibling's name; confirm
+  - Dispatch `Runner doctor` with `pause` set to a target runner's name. If that
+    runner itself picks up the job, confirm the workflow reports the pause as
+    not done and fails the step, then dispatch again so a sibling runner picks
+    it up; once a sibling runs it, confirm the target runner is paused with the
+    workflow run URL recorded as the reason.
+  - Dispatch `Runner doctor` with `resume` set to that runner's name; confirm
     it returns to `idle`.
 
 ---
 
 ## Release Tagging Procedure
 
-1. Ensure `.github/workflows/doctor.yml` has `KIT_REF` set to `v1` (or the
-   exact `v1.x.y` tag).
+1. Ensure `.github/workflows/doctor.yml` defaults `kit-ref` to `v1` (and update
+   the test repository's `.github/workflows/runner-doctor.yml` back to `@v1`
+   without a candidate `kit-ref` override once `v1` is moved).
 2. Tag and push the semantic version and update the floating major tag:
    ```bash
    git tag -a v1.0.0 -m "Release v1.0.0"

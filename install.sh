@@ -63,7 +63,10 @@ choose_bin_dir() {
 if [ "$UNINSTALL" -eq 1 ]; then
   removed=0
   if [ -n "$CUSTOM_BIN_DIR" ]; then
-    candidates=("${CUSTOM_BIN_DIR}/runnerkit")
+    if [ -d "$CUSTOM_BIN_DIR" ]; then
+      CUSTOM_BIN_DIR=$(cd -P "$CUSTOM_BIN_DIR" && pwd)
+    fi
+    candidates=("${CUSTOM_BIN_DIR%/}/runnerkit")
   else
     candidates=(
       "/opt/homebrew/bin/runnerkit"
@@ -93,7 +96,13 @@ fi
 
 TARGET_DIR=$(choose_bin_dir)
 mkdir -p "$TARGET_DIR"
+TARGET_DIR=$(cd -P "$TARGET_DIR" && pwd)
 LINK_PATH="${TARGET_DIR}/runnerkit"
+
+if [ -e "$LINK_PATH" ] && [ ! -L "$LINK_PATH" ]; then
+  printf 'install.sh: refusing to overwrite existing non-symlink destination: %s\n' "$LINK_PATH" >&2
+  exit 1
+fi
 
 ln -sfn "$SOURCE_BIN" "$LINK_PATH"
 printf 'linked %s -> %s\n' "$LINK_PATH" "$SOURCE_BIN"

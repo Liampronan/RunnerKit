@@ -115,7 +115,7 @@ ok    network   github.com and Actions reachable
 - `idle` / `busy`: running (`Runner.Worker` descendant distinguishes `busy`).
   `heal` never touches either, and inside a job `RUNNER_NAME` is never touched.
 - `stopped` / `unloaded`: down or not in `gui/<uid>`. `heal` restarts
-  (`kickstart -k`) or loads (`bootstrap`) up to 3 consecutive attempts before
+  (`kickstart`) or loads (`bootstrap`) up to 3 consecutive attempts before
   marking the runner `flapping` (left alone until `heal --force` or seen
   running).
 - `paused`: intentionally disabled (`launchctl disable` + `bootout`). Does not
@@ -178,8 +178,10 @@ Jobs for the self-hosted labels run on a Mac managed by runnerkit.
   minutes with none `in_progress`.
 - Dispatch the `Runner doctor` workflow and read its job summary. It restarts
   stopped runners and lists what it could not fix.
-- If the doctor's own job is still queued after 5 minutes, no runner is
-  alive. Stop polling and tell the owner.
+- If the doctor's own job is still queued after 5 minutes, check whether
+  matching runners have active (`in_progress`) jobs first. If all matching
+  runners are busy with active jobs, wait for a slot; if none are `in_progress`,
+  no runner is available — stop polling and tell the owner.
 - When a job hangs or keeps failing on one runner while the others work,
   dispatch `Runner doctor` with `pause` set to that runner's name, then re-run
   the job. Tell the owner which runner was paused and why.

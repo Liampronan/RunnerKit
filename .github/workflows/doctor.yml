@@ -32,6 +32,11 @@ on:
         required: false
         default: 20
         type: number
+      kit-ref:
+        description: 'RunnerKit git ref (tag, branch, or commit SHA) to execute'
+        required: false
+        default: 'v1'
+        type: string
 
 permissions:
   contents: read
@@ -46,7 +51,7 @@ jobs:
         shell: /bin/bash {0}
         env:
           KIT_REPO: Liampronan/RunnerKit
-          KIT_REF: v1
+          KIT_REF: ${{ inputs.kit-ref }}
           INPUT_HEAL: ${{ inputs.heal }}
           INPUT_PAUSE: ${{ inputs.pause }}
           INPUT_RESUME: ${{ inputs.resume }}
@@ -59,9 +64,17 @@ jobs:
           KIT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/runnerkit.XXXXXX")
           trap 'rm -rf "$KIT_DIR"' EXIT
 
-          if ! git clone --quiet --depth 1 --branch "$KIT_REF" "https://github.com/${KIT_REPO}.git" "$KIT_DIR" 2>/dev/null; then
-            git clone --quiet --depth 1 --branch main "https://github.com/${KIT_REPO}.git" "$KIT_DIR"
+          git -C "$KIT_DIR" init --quiet
+          git -C "$KIT_DIR" remote add origin "https://github.com/${KIT_REPO}.git"
+          if ! git -C "$KIT_DIR" fetch --quiet --depth 1 origin "$KIT_REF" 2>/dev/null; then
+            if [ "$KIT_REF" = "v1" ]; then
+              git -C "$KIT_DIR" fetch --quiet --depth 1 origin main
+            else
+              printf 'Failed to fetch RunnerKit ref %s from %s\n' "$KIT_REF" "$KIT_REPO" >&2
+              exit 1
+            fi
           fi
+          git -C "$KIT_DIR" checkout --quiet FETCH_HEAD
 
           KIT_BIN="${KIT_DIR}/bin/runnerkit"
           chmod +x "$KIT_BIN"
@@ -82,10 +95,8 @@ jobs:
 
           # 1. Resume requested runners first.
           if [ -n "${INPUT_RESUME:-}" ]; then
-            OLD_IFS="$IFS"
-            IFS=','
-            for raw_name in $INPUT_RESUME; do
-              IFS="$OLD_IFS"
+            printf '%s\n' "$INPUT_RESUME" | tr ',' '\n' >"${KIT_DIR}/resume_list.txt"
+            while IFS= read -r raw_name; do
               rname=$(trim_token "$raw_name")
               [ -n "$rname" ] || continue
               if out=$("$KIT_BIN" resume "$rname" 2>&1); then
@@ -96,16 +107,13 @@ jobs:
                 append_note "- **Failed to resume \`${rname}\`**: ${out}"
                 step_failed=1
               fi
-            done
-            IFS="$OLD_IFS"
+            done <"${KIT_DIR}/resume_list.txt"
           fi
 
           # 2. Pause requested runners next.
           if [ -n "${INPUT_PAUSE:-}" ]; then
-            OLD_IFS="$IFS"
-            IFS=','
-            for raw_name in $INPUT_PAUSE; do
-              IFS="$OLD_IFS"
+            printf '%s\n' "$INPUT_PAUSE" | tr ',' '\n' >"${KIT_DIR}/pause_list.txt"
+            while IFS= read -r raw_name; do
               pname=$(trim_token "$raw_name")
               [ -n "$pname" ] || continue
               if [ -n "${RUNNER_NAME:-}" ] && [ "$pname" = "$RUNNER_NAME" ]; then
@@ -121,8 +129,7 @@ jobs:
                 append_note "- **Failed to pause \`${pname}\`**: ${out}"
                 step_failed=1
               fi
-            done
-            IFS="$OLD_IFS"
+            done <"${KIT_DIR}/pause_list.txt"
           fi
 
           # 3. Heal stopped/unloaded siblings when enabled.

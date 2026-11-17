@@ -144,8 +144,8 @@ Verified automatically on every CI run in `tests/macos_launchd_test.sh`:
   `last exit code = <N>` when loaded.
 - `launchctl bootstrap gui/<uid> <plist>` loads an unloaded plist and starts it
   due to `RunAtLoad`.
-- `launchctl kickstart -k gui/<uid>/<label>` restarts a stopped (loaded, no PID)
-  service.
+- `launchctl kickstart gui/<uid>/<label>` starts a stopped (loaded, no PID)
+  service without `-k`, leaving any concurrently started instance untouched.
 - `launchctl disable gui/<uid>/<label>` followed by
   `launchctl bootout gui/<uid>/<label>` stops the service and records a
   persistent disabled override in `launchd` without modifying the `.plist`.
@@ -159,7 +159,7 @@ Verified automatically on every CI run in `tests/macos_launchd_test.sh`:
 
 Before promoting `v1.0.0` out of pre-release (tracked in
 [`docs/mac-checklist.md`](./mac-checklist.md)):
-1. Confirm `launchctl kickstart -k gui/<uid>/<sibling-label>` and
+1. Confirm `launchctl kickstart gui/<uid>/<sibling-label>` and
    `launchctl disable` / `bootout` work from inside an active GitHub Actions
    runner job (`doctor.yml`) on macOS 13+.
 2. Confirm `launchctl disable gui/<uid>/<label>` keeps a runner with

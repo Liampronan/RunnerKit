@@ -278,7 +278,7 @@ test_heal_actions() {
 
   local calls
   calls=$(cat "${STUB_STATE_DIR}/launchctl.calls")
-  assert_contains "$calls" "kickstart -k gui/501/actions.runner.acme-app.r-stop" "stopped runner kickstarted"
+  assert_contains "$calls" "kickstart gui/501/actions.runner.acme-app.r-stop" "stopped runner kickstarted without -k"
   assert_contains "$calls" "bootstrap gui/501 ${HOME}/Library/LaunchAgents/actions.runner.acme-app.r-unld.plist" "unloaded runner bootstrapped"
   assert_not_contains "$calls" "r-idle" "idle runner untouched"
   assert_not_contains "$calls" "r-busy" "busy runner untouched"
@@ -369,7 +369,7 @@ test_self_skip_and_dry_run() {
   local dry_out rc=0
   dry_out=$("$RUNNERKIT" heal --dry-run) || rc=$?
   assert_eq "1" "$rc" "dry-run still exits 1 while stopped"
-  assert_contains "$dry_out" "dry-run: launchctl kickstart -k" "dry-run prints command"
+  assert_contains "$dry_out" "dry-run: launchctl kickstart gui/" "dry-run prints command"
   if [ -d "${HOME}/Library/Application Support/runnerkit/state" ]; then
     fail "dry-run must not create state directory"
   fi
@@ -730,6 +730,142 @@ test_workflow_sequence() {
   pass "doctor workflow sequence (resume -> pause self refusal -> heal -> doctor summary)"
 }
 
+# ---------------------------------------------------------------------------
+# 12. Review-loop edge cases (leading-zero ints, 00 rejection, glob safety,
+#     JSON key shadowing, double-pause without --reason, install.sh file guard)
+# ---------------------------------------------------------------------------
+test_review_edge_cases() {
+  setup_env
+  add_runner_fixture "actions.runner.acme-app.edge-1" "edge-1" "https://github.com/acme/app" "${TEST_ROOT}/edge1" 1 "555" "0"
+
+  # Overwrite .runner with an earlier string value containing literal "agentName" and "gitHubUrl"
+  cat >"${TEST_ROOT}/edge1/.runner" <<'EOF'
+{
+  "note": "mentions \"agentName\" and \"gitHubUrl\" inside a value",
+  "agentName": "edge-1",
+  "gitHubUrl": "https://github.com/acme/app"
+}
+EOF
+  local j_shadow
+  j_shadow=$("$RUNNERKIT" status --json)
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_eq "edge-1" "$(jq_val "$j_shadow" '.instances[0].name')" "JSON parser ignores key name inside preceding string value"
+    assert_eq "https://github.com/acme/app" "$(jq_val "$j_shadow" '.instances[0].target')" "JSON parser extracts real gitHubUrl"
+  fi
+
+  # Leading-zero base-10 numbers (08, 09) must not trigger Bash octal errors.
+  "$RUNNERKIT" agent install --interval 08 >/dev/null
+  assert_eq "480" "$(plutil -extract StartInterval raw -o - "${HOME}/Library/LaunchAgents/io.runnerkit.heal.plist")" "--interval 08 parsed as decimal 8 (480s)"
+  "$RUNNERKIT" logs edge-1 --lines 09 >/dev/null
+  "$RUNNERKIT" doctor --min-free-gb 08 >/dev/null
+
+  # Multi-zero "00" rejected for positive-integer flags (--interval and --lines).
+  local rc=0
+  "$RUNNERKIT" agent install --interval 00 >/dev/null 2>&1 || rc=$?
+  assert_eq "2" "$rc" "--interval 00 rejected with exit 2"
+  rc=0
+  "$RUNNERKIT" logs edge-1 --lines 00 >/dev/null 2>&1 || rc=$?
+  assert_eq "2" "$rc" "--lines 00 rejected with exit 2"
+
+  # Glob characters in --require-runtime must not expand against cwd filenames.
+  rc=0
+  local glob_doc
+  glob_doc=$("$RUNNERKIT" doctor --require-runtime '*' --json) || rc=$?
+  assert_eq "1" "$rc" "literal '*' runtime fails cleanly without globbing"
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_contains "$(jq_val "$glob_doc" '.checks[] | select(.id=="runtime") | .value')" "* not installed" "literal '*' preserved without pathname expansion"
+  fi
+
+  # Re-pausing without --reason preserves existing paused_reason.
+  "$RUNNERKIT" pause edge-1 --reason "keep me" >/dev/null
+  "$RUNNERKIT" pause edge-1 >/dev/null
+  local j_repause
+  j_repause=$("$RUNNERKIT" status --json)
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_eq "keep me" "$(jq_val "$j_repause" '.instances[0].paused_reason')" "re-pausing without --reason preserves existing reason"
+  fi
+
+  # Resume keeps pause record and exits 1 if enable or bootstrap fails, remaining retryable.
+  export STUB_FAIL_ENABLE="1"
+  rc=0
+  "$RUNNERKIT" resume edge-1 >/dev/null 2>&1 || rc=$?
+  assert_eq "1" "$rc" "resume exits 1 when launchctl enable fails"
+  unset STUB_FAIL_ENABLE
+
+  export STUB_FAIL_BOOTSTRAP="1"
+  rc=0
+  "$RUNNERKIT" resume edge-1 >/dev/null 2>&1 || rc=$?
+  assert_eq "1" "$rc" "resume exits 1 when launchctl bootstrap fails"
+  unset STUB_FAIL_BOOTSTRAP
+
+  # Subsequent resume succeeds because the pause record was retained!
+  local j_res_retry
+  j_res_retry=$("$RUNNERKIT" resume edge-1 --json)
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_eq "idle" "$(jq_val "$j_res_retry" '.instances[0].state')" "retry resume brings runner back to idle"
+    assert_eq "resumed" "$(jq_val "$j_res_retry" '.instances[0].action')" "retry resume records action=resumed"
+  fi
+
+  # Pause race: job starts after snapshot/disable and before bootout -> refused without --now!
+  local cur_pid
+  cur_pid=$(sed -n 's/^PID=//p' "${STUB_STATE_DIR}/services/actions.runner.acme-app.edge-1.svc")
+  export STUB_RACE_BUSY_ON_DISABLE="881 ${cur_pid}"
+  rc=0
+  "$RUNNERKIT" pause edge-1 >/dev/null 2>&1 || rc=$?
+  assert_eq "1" "$rc" "pause refuses when runner becomes busy right before bootout"
+  unset STUB_RACE_BUSY_ON_DISABLE
+  : >"${STUB_STATE_DIR}/procs"
+
+  # Pause bootout failure: propagates non-zero exit AND marks idle listener unhealthy!
+  export STUB_FAIL_BOOTOUT="1"
+  rc=0
+  local j_pfail
+  j_pfail=$("$RUNNERKIT" pause edge-1 --reason "bootout test" --json 2>/dev/null) || rc=$?
+  assert_eq "1" "$rc" "pause exits 1 when bootout fails"
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_eq "false" "$(jq_val "$j_pfail" '.healthy')" "paused runner with still-running idle listener is unhealthy"
+  fi
+  unset STUB_FAIL_BOOTOUT
+  # Retry pause now succeeds cleanly.
+  "$RUNNERKIT" pause edge-1 >/dev/null
+  "$RUNNERKIT" resume edge-1 >/dev/null
+
+  # Stale stderr.log rejection from an earlier registration (.runner newer than stderr.log)
+  # must NOT block recovery when the repaired runner stops later.
+  printf 'Runner OAuth token has been revoked\n' >"${HOME}/Library/Logs/actions.runner.acme-app.edge-1/stderr.log"
+  sleep 1
+  touch "${TEST_ROOT}/edge1/.runner"
+  cat >"${STUB_STATE_DIR}/services/actions.runner.acme-app.edge-1.svc" <<'EOF'
+LOADED=1
+PID=
+LAST_EXIT=1
+CRASH_ON_START=0
+SPAWN_PID=577
+EOF
+  rc=0
+  local j_stale_err
+  j_stale_err=$("$RUNNERKIT" status --json) || rc=$?
+  assert_eq "1" "$rc" "stopped runner exits 1"
+  if [ "$HAS_JQ" -eq 1 ]; then
+    assert_eq "stopped" "$(jq_val "$j_stale_err" '.instances[0].state')" "stale stderr rejection before re-registration classified as stopped, not rejected"
+  fi
+  "$RUNNERKIT" heal >/dev/null
+
+  # install.sh refuses to clobber a regular non-symlink file, and resolves relative --bin-dir to absolute PATH.
+  local guarded_bin="${TEST_ROOT}/guarded-bin"
+  mkdir -p "$guarded_bin"
+  printf 'existing binary\n' >"${guarded_bin}/runnerkit"
+  rc=0
+  "$INSTALL_SH" --bin-dir "$guarded_bin" >/dev/null 2>&1 || rc=$?
+  assert_eq "1" "$rc" "install.sh refuses to overwrite regular file"
+
+  local rel_out
+  rel_out=$(cd "$TEST_ROOT" && "$INSTALL_SH" --bin-dir "./rel-tools")
+  assert_contains "$rel_out" "export PATH=\"${TEST_ROOT}/rel-tools:\$PATH\"" "install.sh prints resolved absolute PATH for relative --bin-dir"
+
+  pass "review-loop edge cases (JSON shadowing, octal/00, glob safety, pause race & bootout failure, retryable resume, stale stderr, install.sh)"
+}
+
 printf 'Running runnerkit test suite...\n'
 test_no_instances
 test_all_base_states
@@ -742,4 +878,5 @@ test_pause_and_resume
 test_doctor_checks
 test_agent_install_and_exit_codes
 test_workflow_sequence
+test_review_edge_cases
 printf 'All %s test groups passed.\n' "$PASS_COUNT"

@@ -109,10 +109,45 @@ j_unloaded=$(/bin/bash "$RUNNERKIT" status --json) || rc=$?
 [ "$rc" -eq 1 ] || { printf 'Expected exit 1 for unloaded\n' >&2; exit 1; }
 assert_json_field "$j_unloaded" '.instances[0].state' 'unloaded' 'unbootstrapped plist detected as unloaded'
 
+wait_for_stopped_exit1() {
+  local target="gui/${UID_NUM}/${DUMMY_LABEL}"
+  local attempt=0
+  local out=""
+  while [ "$attempt" -lt 40 ]; do
+    if out=$(launchctl print "$target" 2>&1); then
+      if ! printf '%s\n' "$out" | grep -E -q '^[[:space:]]*pid[[:space:]]*=' \
+         && printf '%s\n' "$out" | grep -E -q 'last exit code = 1([[:space:]]|$)'; then
+        return 0
+      fi
+    fi
+    sleep 0.25
+    attempt=$((attempt + 1))
+  done
+  printf 'FAIL: timed out waiting for %s to stay loaded with no PID and last exit code = 1.\n' "$target" >&2
+  printf 'launchctl print output:\n%s\n' "$out" >&2
+  launchctl list | grep -F "$DUMMY_LABEL" >&2 || true
+  exit 1
+}
+
+wait_for_unloaded() {
+  local target="gui/${UID_NUM}/${DUMMY_LABEL}"
+  local attempt=0
+  while [ "$attempt" -lt 40 ]; do
+    if ! launchctl print "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+    attempt=$((attempt + 1))
+  done
+  printf 'FAIL: timed out waiting for %s to unload.\n' "$target" >&2
+  launchctl print "$target" >&2 || true
+  exit 1
+}
+
 # 2. Bootstrap with mode=exit1 -> service loads, exits 1, stays stopped.
 printf 'exit1' >"${DUMMY_DIR}/mode"
 launchctl bootstrap "gui/${UID_NUM}" "$PLIST_PATH"
-sleep 2
+wait_for_stopped_exit1
 
 rc=0
 j_stopped=$(/bin/bash "$RUNNERKIT" status --json) || rc=$?
@@ -120,7 +155,7 @@ j_stopped=$(/bin/bash "$RUNNERKIT" status --json) || rc=$?
 assert_json_field "$j_stopped" '.instances[0].state' 'stopped' 'crashed service detected as stopped'
 assert_json_field "$j_stopped" '.instances[0].last_exit' '1' 'stopped service reports last_exit=1'
 
-# 3. Switch mode=sleep and run `runnerkit heal` -> kickstart -k brings it up to idle.
+# 3. Switch mode=sleep and run `runnerkit heal` -> kickstart brings it up to idle.
 printf 'sleep' >"${DUMMY_DIR}/mode"
 j_healed=$(/bin/bash "$RUNNERKIT" heal --json)
 assert_json_field "$j_healed" '.instances[0].state' 'idle' 'heal kickstart brings stopped service to idle'
@@ -128,7 +163,7 @@ assert_json_field "$j_healed" '.instances[0].action' 'restarted' 'heal records a
 
 # 4. Manually bootout -> unloaded -> `runnerkit heal` bootstraps it back to idle.
 launchctl bootout "gui/${UID_NUM}/${DUMMY_LABEL}"
-sleep 1
+wait_for_unloaded
 j_reloaded=$(/bin/bash "$RUNNERKIT" heal --json)
 assert_json_field "$j_reloaded" '.instances[0].state' 'idle' 'heal bootstrap brings unloaded service to idle'
 assert_json_field "$j_reloaded" '.instances[0].action' 'loaded' 'heal records action=loaded'

@@ -109,13 +109,23 @@ case "$cmd" in
     ;;
 
   kickstart)
-    # kickstart -k gui/<uid>/<label>
-    target="${3:-}"
+    # kickstart [-k] gui/<uid>/<label>
+    kill_flag=0
+    if [ "${2:-}" = "-k" ]; then
+      kill_flag=1
+      target="${3:-}"
+    else
+      target="${2:-}"
+    fi
     label="${target#gui/*/}"
     f="${SVC_DIR}/${label}.svc"
     [ -f "$f" ] || exit 113
     loaded=$(read_svc_var "$f" "LOADED" "0")
     [ "$loaded" = "1" ] || exit 113
+    cur_pid=$(read_svc_var "$f" "PID" "")
+    if [ -n "$cur_pid" ] && [ "$kill_flag" -eq 0 ]; then
+      exit 0
+    fi
     crash=$(read_svc_var "$f" "CRASH_ON_START" "0")
     spawn_pid=$(read_svc_var "$f" "SPAWN_PID" "901")
     if [ "$crash" = "1" ]; then
@@ -128,6 +138,10 @@ case "$cmd" in
 
   bootstrap)
     # bootstrap gui/<uid> <plist>
+    if [ "${STUB_FAIL_BOOTSTRAP:-0}" = "1" ]; then
+      printf 'Bootstrap failed: 5: Input/output error\n' >&2
+      exit 5
+    fi
     plist="${3:-}"
     [ -f "$plist" ] || exit 1
     label=$(plutil -extract Label raw -o - "$plist" 2>/dev/null || true)
@@ -152,6 +166,10 @@ case "$cmd" in
 
   bootout)
     # bootout gui/<uid>/<label>
+    if [ "${STUB_FAIL_BOOTOUT:-0}" = "1" ]; then
+      printf 'Boot-out failed: 5: Input/output error\n' >&2
+      exit 5
+    fi
     target="${2:-}"
     label="${target#gui/*/}"
     f="${SVC_DIR}/${label}.svc"
@@ -173,10 +191,17 @@ case "$cmd" in
     target="${2:-}"
     label="${target#gui/*/}"
     : >"${DIS_DIR}/${label}"
+    if [ -n "${STUB_RACE_BUSY_ON_DISABLE:-}" ]; then
+      printf '%s /Users/ci/race/bin/Runner.Worker spawnclient 1 2\n' "$STUB_RACE_BUSY_ON_DISABLE" >>"${STATE_ROOT}/procs"
+    fi
     exit 0
     ;;
 
   enable)
+    if [ "${STUB_FAIL_ENABLE:-0}" = "1" ]; then
+      printf 'Enable failed: 1: Operation not permitted\n' >&2
+      exit 1
+    fi
     target="${2:-}"
     label="${target#gui/*/}"
     rm -f "${DIS_DIR}/${label}"
