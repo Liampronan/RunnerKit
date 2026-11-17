@@ -1,0 +1,214 @@
+#!/bin/bash
+# Stateful stub launchctl recording calls and emulating gui/<uid>/<label> domain behavior.
+set -euo pipefail
+
+STATE_ROOT="${STUB_STATE_DIR:?STUB_STATE_DIR must be set}"
+SVC_DIR="${STATE_ROOT}/services"
+DIS_DIR="${STATE_ROOT}/disabled"
+CALLS_LOG="${STATE_ROOT}/launchctl.calls"
+mkdir -p "$SVC_DIR" "$DIS_DIR"
+
+cmd="${1:-}"
+
+# Record mutating calls for test assertions.
+case "$cmd" in
+  kickstart|bootstrap|bootout|disable|enable)
+    printf '%s\n' "$*" >>"$CALLS_LOG"
+    ;;
+esac
+
+read_svc_var() {
+  local f="$1"
+  local k="$2"
+  local def="${3:-}"
+  if [ ! -f "$f" ]; then
+    printf '%s' "$def"
+    return 0
+  fi
+  local v
+  v=$(sed -n -E "s/^${k}=(.*)$/\\1/p" "$f" | tail -n 1)
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+  else
+    printf '%s' "$def"
+  fi
+}
+
+write_svc_state() {
+  local f="$1"
+  local loaded="$2"
+  local pid="$3"
+  local last_exit="$4"
+  local crash="$5"
+  local spawn_pid="$6"
+  cat >"$f" <<EOF
+LOADED=${loaded}
+PID=${pid}
+LAST_EXIT=${last_exit}
+CRASH_ON_START=${crash}
+SPAWN_PID=${spawn_pid}
+EOF
+}
+
+case "$cmd" in
+  print)
+    target="${2:-}"
+    case "$target" in
+      gui/*/*)
+        if [ "${STUB_NO_GUI_SESSION:-0}" = "1" ]; then
+          exit 113
+        fi
+        label="${target#gui/*/}"
+        f="${SVC_DIR}/${label}.svc"
+        [ -f "$f" ] || exit 113
+        loaded=$(read_svc_var "$f" "LOADED" "0")
+        [ "$loaded" = "1" ] || exit 113
+        pid=$(read_svc_var "$f" "PID" "")
+        lexit=$(read_svc_var "$f" "LAST_EXIT" "")
+        printf '%s = {\n' "$target"
+        if [ -n "$pid" ]; then
+          printf '\tstate = running\n'
+          printf '\tpid = %s\n' "$pid"
+        else
+          printf '\tstate = not running\n'
+        fi
+        if [ -n "$lexit" ]; then
+          printf '\tlast exit code = %s\n' "$lexit"
+        else
+          printf '\tlast exit code = (never exited)\n'
+        fi
+        printf '}\n'
+        exit 0
+        ;;
+      gui/*)
+        if [ "${STUB_NO_GUI_SESSION:-0}" = "1" ]; then
+          exit 113
+        fi
+        printf '%s = {\n\tstate = active\n}\n' "$target"
+        exit 0
+        ;;
+      *)
+        exit 113
+        ;;
+    esac
+    ;;
+
+  list)
+    printf 'PID\tStatus\tLabel\n'
+    for f in "${SVC_DIR}"/*.svc; do
+      [ -f "$f" ] || continue
+      loaded=$(read_svc_var "$f" "LOADED" "0")
+      [ "$loaded" = "1" ] || continue
+      base=$(basename "$f")
+      label="${base%.svc}"
+      pid=$(read_svc_var "$f" "PID" "-")
+      lexit=$(read_svc_var "$f" "LAST_EXIT" "0")
+      printf '%s\t%s\t%s\n' "${pid:--}" "${lexit:-0}" "$label"
+    done
+    exit 0
+    ;;
+
+  kickstart)
+    # kickstart [-k] gui/<uid>/<label>
+    kill_flag=0
+    if [ "${2:-}" = "-k" ]; then
+      kill_flag=1
+      target="${3:-}"
+    else
+      target="${2:-}"
+    fi
+    label="${target#gui/*/}"
+    f="${SVC_DIR}/${label}.svc"
+    [ -f "$f" ] || exit 113
+    loaded=$(read_svc_var "$f" "LOADED" "0")
+    [ "$loaded" = "1" ] || exit 113
+    cur_pid=$(read_svc_var "$f" "PID" "")
+    if [ -n "$cur_pid" ] && [ "$kill_flag" -eq 0 ]; then
+      exit 0
+    fi
+    crash=$(read_svc_var "$f" "CRASH_ON_START" "0")
+    spawn_pid=$(read_svc_var "$f" "SPAWN_PID" "901")
+    if [ "$crash" = "1" ]; then
+      write_svc_state "$f" "1" "" "1" "$crash" "$spawn_pid"
+    else
+      write_svc_state "$f" "1" "$spawn_pid" "0" "$crash" "$spawn_pid"
+    fi
+    exit 0
+    ;;
+
+  bootstrap)
+    # bootstrap gui/<uid> <plist>
+    if [ "${STUB_FAIL_BOOTSTRAP:-0}" = "1" ]; then
+      printf 'Bootstrap failed: 5: Input/output error\n' >&2
+      exit 5
+    fi
+    plist="${3:-}"
+    [ -f "$plist" ] || exit 1
+    label=$(plutil -extract Label raw -o - "$plist" 2>/dev/null || true)
+    if [ -z "$label" ]; then
+      base=$(basename "$plist")
+      label="${base%.plist}"
+    fi
+    if [ -f "${DIS_DIR}/${label}" ]; then
+      # launchd refuses bootstrap of a disabled service
+      exit 119
+    fi
+    f="${SVC_DIR}/${label}.svc"
+    crash=$(read_svc_var "$f" "CRASH_ON_START" "0")
+    spawn_pid=$(read_svc_var "$f" "SPAWN_PID" "902")
+    if [ "$crash" = "1" ]; then
+      write_svc_state "$f" "1" "" "1" "$crash" "$spawn_pid"
+    else
+      write_svc_state "$f" "1" "$spawn_pid" "0" "$crash" "$spawn_pid"
+    fi
+    exit 0
+    ;;
+
+  bootout)
+    # bootout gui/<uid>/<label>
+    if [ "${STUB_FAIL_BOOTOUT:-0}" = "1" ]; then
+      printf 'Boot-out failed: 5: Input/output error\n' >&2
+      exit 5
+    fi
+    target="${2:-}"
+    label="${target#gui/*/}"
+    f="${SVC_DIR}/${label}.svc"
+    if [ ! -f "$f" ]; then
+      exit 3
+    fi
+    loaded=$(read_svc_var "$f" "LOADED" "0")
+    if [ "$loaded" != "1" ]; then
+      exit 3
+    fi
+    lexit=$(read_svc_var "$f" "LAST_EXIT" "0")
+    crash=$(read_svc_var "$f" "CRASH_ON_START" "0")
+    spawn_pid=$(read_svc_var "$f" "SPAWN_PID" "901")
+    write_svc_state "$f" "0" "" "$lexit" "$crash" "$spawn_pid"
+    exit 0
+    ;;
+
+  disable)
+    target="${2:-}"
+    label="${target#gui/*/}"
+    : >"${DIS_DIR}/${label}"
+    if [ -n "${STUB_RACE_BUSY_ON_DISABLE:-}" ]; then
+      printf '%s /Users/ci/race/bin/Runner.Worker spawnclient 1 2\n' "$STUB_RACE_BUSY_ON_DISABLE" >>"${STATE_ROOT}/procs"
+    fi
+    exit 0
+    ;;
+
+  enable)
+    if [ "${STUB_FAIL_ENABLE:-0}" = "1" ]; then
+      printf 'Enable failed: 1: Operation not permitted\n' >&2
+      exit 1
+    fi
+    target="${2:-}"
+    label="${target#gui/*/}"
+    rm -f "${DIS_DIR}/${label}"
+    exit 0
+    ;;
+
+  *)
+    exit 1
+    ;;
+esac

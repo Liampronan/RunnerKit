@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = "simctl" ] && [ "${2:-}" = "list" ] && [ "${3:-}" = "runtimes" ]; then
+  if [ "${STUB_SIMCTL_FAIL:-0}" = "1" ]; then
+    printf 'Unable to boot CoreSimulatorService\n' >&2
+    exit 1
+  fi
+  if [ -n "${STUB_RUNTIMES_OUTPUT+x}" ]; then
+    printf '%s\n' "$STUB_RUNTIMES_OUTPUT"
+  else
+    cat <<'EOF'
+== Runtimes ==
+iOS 25.0 (25.0 - 23A100) - com.apple.CoreSimulator.SimRuntime.iOS-25-0 (unavailable, runtime profile not found)
+iOS 26.5 (26.5 - 24F50) - com.apple.CoreSimulator.SimRuntime.iOS-26-5
+EOF
+  fi
+  exit 0
+fi
+exit 1

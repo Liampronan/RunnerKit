@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = "-s" ] || [ "$#" -eq 0 ]; then
+  printf '%s\n' "${STUB_UNAME:-Darwin}"
+else
+  printf '%s\n' "${STUB_UNAME:-Darwin}"
+fi

@@ -1,0 +1,49 @@
+#!/bin/bash
+# Stub pgrep reading process table from $STUB_STATE_DIR/procs ("<pid> <ppid> <cmdline>").
+set -euo pipefail
+
+PROCS_FILE="${STUB_STATE_DIR:-}/procs"
+[ -f "$PROCS_FILE" ] || exit 1
+
+full_match=0
+ppid=""
+pattern=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -f) full_match=1; shift ;;
+    -P) ppid="${2:-}"; shift 2 ;;
+    *)  pattern="$1"; shift ;;
+  esac
+done
+
+matched=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  p=$(printf '%s\n' "$line" | awk '{print $1}')
+  pp=$(printf '%s\n' "$line" | awk '{print $2}')
+  cmd=$(printf '%s\n' "$line" | cut -d' ' -f3-)
+  if [ -n "$ppid" ] && [ "$pp" != "$ppid" ]; then
+    continue
+  fi
+  if [ -n "$pattern" ]; then
+    if [ "$full_match" -eq 1 ]; then
+      if ! printf '%s\n' "$cmd" | grep -E -q "$pattern"; then
+        continue
+      fi
+    else
+      comm=$(printf '%s\n' "$cmd" | awk '{print $1}')
+      if ! printf '%s\n' "$comm" | grep -E -q "$pattern"; then
+        continue
+      fi
+    fi
+  fi
+  printf '%s\n' "$p"
+  matched=1
+done <"$PROCS_FILE"
+
+if [ "$matched" -eq 1 ]; then
+  exit 0
+else
+  exit 1
+fi

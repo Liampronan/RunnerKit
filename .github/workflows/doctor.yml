@@ -1,0 +1,184 @@
+name: Runner doctor
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'JSON array of runner labels, e.g. ["self-hosted","macOS"]'
+        required: true
+        type: string
+      heal:
+        description: 'Restart stopped or unloaded sibling runners before running doctor'
+        required: false
+        default: true
+        type: boolean
+      pause:
+        description: 'Comma-separated runner names to take out of rotation'
+        required: false
+        default: ''
+        type: string
+      resume:
+        description: 'Comma-separated runner names to return to rotation'
+        required: false
+        default: ''
+        type: string
+      require-runtimes:
+        description: 'Space- or comma-separated simulator runtime IDs (e.g. iOS-26-0)'
+        required: false
+        default: ''
+        type: string
+      min-free-gb:
+        description: 'Minimum free disk space in GB'
+        required: false
+        default: 20
+        type: number
+      kit-ref:
+        description: 'RunnerKit git ref (tag, branch, or commit SHA) to execute'
+        required: false
+        default: 'v1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  doctor:
+    name: Runner doctor
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Run RunnerKit doctor
+        shell: /bin/bash {0}
+        env:
+          KIT_REPO: Liampronan/RunnerKit
+          KIT_REF: ${{ inputs.kit-ref }}
+          INPUT_HEAL: ${{ inputs.heal }}
+          INPUT_PAUSE: ${{ inputs.pause }}
+          INPUT_RESUME: ${{ inputs.resume }}
+          INPUT_REQUIRE_RUNTIMES: ${{ inputs.require-runtimes }}
+          INPUT_MIN_FREE_GB: ${{ inputs.min-free-gb }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          KIT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/runnerkit.XXXXXX")
+          trap 'rm -rf "$KIT_DIR"' EXIT
+
+          git -C "$KIT_DIR" init --quiet
+          git -C "$KIT_DIR" remote add origin "https://github.com/${KIT_REPO}.git"
+          if ! git -C "$KIT_DIR" fetch --quiet --depth 1 origin "$KIT_REF" 2>/dev/null; then
+            if [ "$KIT_REF" = "v1" ]; then
+              git -C "$KIT_DIR" fetch --quiet --depth 1 origin main
+            else
+              printf 'Failed to fetch RunnerKit ref %s from %s\n' "$KIT_REF" "$KIT_REPO" >&2
+              exit 1
+            fi
+          fi
+          git -C "$KIT_DIR" checkout --quiet FETCH_HEAD
+
+          KIT_BIN="${KIT_DIR}/bin/runnerkit"
+          chmod +x "$KIT_BIN"
+
+          trim_token() {
+            local s="$1"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          step_failed=0
+          action_notes=""
+
+          append_note() {
+            action_notes="${action_notes}${1}"$'\n'
+          }
+
+          # 1. Resume requested runners first.
+          if [ -n "${INPUT_RESUME:-}" ]; then
+            printf '%s\n' "$INPUT_RESUME" | tr ',' '\n' >"${KIT_DIR}/resume_list.txt"
+            while IFS= read -r raw_name; do
+              rname=$(trim_token "$raw_name")
+              [ -n "$rname" ] || continue
+              if out=$("$KIT_BIN" resume "$rname" 2>&1); then
+                printf '%s\n' "$out"
+                append_note "- Resumed \`${rname}\`"
+              else
+                printf '%s\n' "$out" >&2
+                append_note "- **Failed to resume \`${rname}\`**: ${out}"
+                step_failed=1
+              fi
+            done <"${KIT_DIR}/resume_list.txt"
+          fi
+
+          # 2. Pause requested runners next.
+          if [ -n "${INPUT_PAUSE:-}" ]; then
+            printf '%s\n' "$INPUT_PAUSE" | tr ',' '\n' >"${KIT_DIR}/pause_list.txt"
+            while IFS= read -r raw_name; do
+              pname=$(trim_token "$raw_name")
+              [ -n "$pname" ] || continue
+              if [ -n "${RUNNER_NAME:-}" ] && [ "$pname" = "$RUNNER_NAME" ]; then
+                msg="Could not pause '${pname}': this doctor job is running on '${pname}'. Dispatch Runner doctor again to pause it from a sibling runner."
+                printf '%s\n' "$msg" >&2
+                append_note "- **Not done (\`${pname}\`)**: job landed on \`${pname}\`; dispatch again so a sibling runner pauses it."
+                step_failed=1
+              elif out=$("$KIT_BIN" pause "$pname" --now --reason "$RUN_URL" 2>&1); then
+                printf '%s\n' "$out"
+                append_note "- Paused \`${pname}\` (reason: ${RUN_URL})"
+              else
+                printf '%s\n' "$out" >&2
+                append_note "- **Failed to pause \`${pname}\`**: ${out}"
+                step_failed=1
+              fi
+            done <"${KIT_DIR}/pause_list.txt"
+          fi
+
+          # 3. Heal stopped/unloaded siblings when enabled.
+          if [ "${INPUT_HEAL:-true}" = "true" ]; then
+            heal_out=$("$KIT_BIN" heal 2>&1) || true
+            printf '%s\n' "$heal_out"
+            healed_lines=$(printf '%s\n' "$heal_out" | grep -E 'action: (restarted|loaded|stopped_paused)' || true)
+            if [ -n "$healed_lines" ]; then
+              printf '%s\n' "$healed_lines" >"${KIT_DIR}/healed.txt"
+              while IFS= read -r hline; do
+                [ -n "$hline" ] && append_note "- Heal: \`${hline}\`"
+              done <"${KIT_DIR}/healed.txt"
+            fi
+          fi
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf "Executed on runner: \`%s\`\n\n" "${RUNNER_NAME:-unknown}"
+              if [ -n "$action_notes" ]; then
+                printf '#### Requested Actions\n\n%s\n' "$action_notes"
+              fi
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+          # 4. Run doctor and write both JSON artifact and Markdown job summary.
+          doc_args=(--min-free-gb "${INPUT_MIN_FREE_GB:-20}")
+          if [ -n "${INPUT_REQUIRE_RUNTIMES:-}" ]; then
+            doc_args+=(--require-runtime "$INPUT_REQUIRE_RUNTIMES")
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            doc_args+=(--summary "$GITHUB_STEP_SUMMARY")
+          fi
+
+          JSON_OUT="${RUNNER_TEMP:-/tmp}/runnerkit-doctor.json"
+          doctor_rc=0
+          "$KIT_BIN" doctor "${doc_args[@]}" --json >"$JSON_OUT" || doctor_rc=$?
+
+          # Print human report to job log for quick terminal inspection.
+          "$KIT_BIN" doctor --min-free-gb "${INPUT_MIN_FREE_GB:-20}" \
+            ${INPUT_REQUIRE_RUNTIMES:+--require-runtime "$INPUT_REQUIRE_RUNTIMES"} || true
+
+          if [ "$doctor_rc" -ne 0 ] || [ "$step_failed" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload doctor JSON report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runnerkit-doctor
+          path: ${{ runner.temp }}/runnerkit-doctor.json
+          if-no-files-found: ignore

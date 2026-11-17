@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+free_gb="${STUB_FREE_GB:-212}"
+avail_kb=$((free_gb * 1048576))
+total_kb=$((avail_kb + 52428800))
+used_kb=52428800
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf '/dev/disk3s1s1 %s %s %s 20%% /\n' "$total_kb" "$used_kb" "$avail_kb"
